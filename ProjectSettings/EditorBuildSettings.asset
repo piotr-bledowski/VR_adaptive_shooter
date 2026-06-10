@@ -5,18 +5,15 @@ EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
   m_Scenes:
-  - enabled: 0
-    path: Assets/Scenes/Seal.unity
-    guid: 0638318eae0b03749be866e6636e60bc
-  - enabled: 0
-    path: Assets/Scenes/Shooter.unity
-    guid: bc61f5d89adce384d84b3b4c0fd7163d
   - enabled: 1
     path: Assets/Scenes/Shooter.unity
     guid: bc61f5d89adce384d84b3b4c0fd7163d
   - enabled: 0
     path: Assets/Scenes/ShooterTraining.unity
     guid: c45da1d4777ba06439300fdc1a515e69
+  - enabled: 1
+    path: Assets/Scenes/ShooterOnlineSim.unity
+    guid: 3ba369505d8d8124dafe1abc83ddbc46
   m_configObjects:
     Unity.XR.Oculus.Settings: {fileID: 11400000, guid: 369a23b94be995945ab029192a8be0ae, type: 2}
     com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 6142f20ea8b831a44a6448ecc75b2bb8, type: 2}
