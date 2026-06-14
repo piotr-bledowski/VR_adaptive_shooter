@@ -7,12 +7,9 @@ public enum RoundState { Idle, Active, Results }
 /// <summary>
 /// Central game-loop controller for the Shooter scene.
 ///
-///   Idle    — waiting for player to press the start button; shows previous stats.
-///   Active  — 30-second round, targets live, shots counted.
+///   Idle    — waiting for player to press the start button.
+///   Active  — 30-second round, targets spawn sequentially, shots counted.
 ///   Results — targets despawn, stats panel shown, button re-enables.
-///
-/// Also owns the ShooterStats instance and handles near-miss detection
-/// (checked synchronously at fire time, before the bullet travels).
 /// </summary>
 public class ShooterRoundManager : MonoBehaviour
 {
@@ -22,12 +19,11 @@ public class ShooterRoundManager : MonoBehaviour
     public float despawnDelay   = 1.5f;
 
     [Header("Training mode")]
-    [Tooltip("When true, skips disk writes and session-phase checks (used by training scene).")]
+    [Tooltip("When true, skips disk writes and session-phase checks.")]
     public bool trainingMode = false;
 
     [Header("Near-miss")]
-    [Tooltip("Half-angle of the miss cone in degrees. "
-           + "Shots within this angle of a target count as a close miss.")]
+    [Tooltip("Half-angle of the miss cone in degrees.")]
     public float nearMissAngleDeg = 8f;
 
     [Header("References")]
@@ -41,29 +37,21 @@ public class ShooterRoundManager : MonoBehaviour
     [Header("Live stats (read-only in Inspector)")]
     public ShooterStats stats = new ShooterStats();
 
-    // ── State ─────────────────────────────────────────────────────────────────
-
     public RoundState CurrentState  { get; set; } = RoundState.Idle;
     public float      TimeRemaining { get; set; }
 
-    /// <summary>All targets currently active — used for near-miss detection.</summary>
     public IReadOnlyList<ShooterTarget> ActiveTargets =>
         targetManager != null ? targetManager.ActiveTargetsList
                               : _empty;
 
-    private static readonly List<ShooterTarget> _empty = new List<ShooterTarget>();
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    static readonly List<ShooterTarget> _empty = new List<ShooterTarget>();
 
     void Start()
     {
         if (startButton != null)
             startButton.OnActivated += StartRound;
-        // CanActivate is owned by PlayerSessionManager (lobby) and this class (during rounds).
-        hud?.SetRoundState(RoundState.Idle, null);
+        hud?.SetRoundState(RoundState.Idle, null, null, null);
     }
-
-    private float _lastMidRoundCheck;
 
     void Update()
     {
@@ -72,25 +60,16 @@ public class ShooterRoundManager : MonoBehaviour
         TimeRemaining -= Time.deltaTime;
         hud?.SetTimer(Mathf.Max(0f, TimeRemaining));
 
-        // Request agent decisions during active round
         flowAgent?.RequestAgentDecision();
 
-        // Update event log active count
         if (eventLog != null && targetManager != null)
             eventLog.ActiveTargetCount = targetManager.ActiveTargetsList.Count;
-
-        // Adaptive mid-round check every 5 seconds
-        if (adaptiveController != null && Time.time - _lastMidRoundCheck >= 5f)
-        {
-            _lastMidRoundCheck = Time.time;
-            adaptiveController.MidRoundCheck();
-        }
 
         if (TimeRemaining <= 0f)
             EndRound();
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Public API ──────────────────────────────────────────────────────────
 
     public void StartRound()
     {
@@ -106,35 +85,45 @@ public class ShooterRoundManager : MonoBehaviour
         stats.Reset();
         TimeRemaining = roundDuration;
         CurrentState  = RoundState.Active;
-        _lastMidRoundCheck = Time.time;
 
         SetStartButtonVisible(false);
         eventLog?.BeginRound();
-
-        // Let adaptive controller set difficulty before spawning starts
         adaptiveController?.OnRoundStart();
-
         targetManager?.BeginRoundSpawning();
-        hud?.SetRoundState(RoundState.Active, null);
+        hud?.SetRoundState(RoundState.Active, null, null, null);
     }
 
     /// <summary>
-    /// Called by ShooterGun immediately when the trigger is pressed.
-    /// Records a shot and performs the close-miss heuristic.
-    /// aimOnTarget = true means the gun's aiming beam was already pointing at
-    /// a target when fired, so we skip the miss-proximity scan.
+    /// Called by ShooterGun when the trigger is pressed.
+    /// In the new sequential model, we assume the player is shooting at the
+    /// oldest active target for per-type shot attribution.
     /// </summary>
     public void HandleShotFired(Vector3 origin, Vector3 direction, bool aimOnTarget)
     {
         if (CurrentState != RoundState.Active) return;
 
-        stats.RecordShot();
+        // Attribute shot to oldest target's type (sequential assumption)
+        TargetType shotType = TargetType.Stationary;
+        bool shotAtRotating = false;
+        var targets = ActiveTargets;
+        if (targets.Count > 0)
+        {
+            ShooterTarget oldest = targets[0];
+            for (int i = 1; i < targets.Count; i++)
+            {
+                if (targets[i].LastSpawnTime < oldest.LastSpawnTime)
+                    oldest = targets[i];
+            }
+            shotType = oldest.targetType;
+            shotAtRotating = oldest.rotationSpeed != RotationSpeed.None;
+        }
+
+        stats.RecordShot(shotType, shotAtRotating);
         eventLog?.LogShotFired(origin);
-        adaptiveController?.OnShotFired();
+        adaptiveController?.OnShotFired(shotType, shotAtRotating);
 
         if (!aimOnTarget)
         {
-            var targets = ActiveTargets;
             for (int i = 0; i < targets.Count; i++)
             {
                 ShooterTarget t = targets[i];
@@ -144,36 +133,41 @@ public class ShooterRoundManager : MonoBehaviour
                 float   angle    = Vector3.Angle(direction, toTarget);
                 if (angle < nearMissAngleDeg)
                 {
-                    stats.RecordCloseMiss(t.targetType);
+                    stats.RecordCloseMiss(t.targetType, t.rotationSpeed != RotationSpeed.None);
                     eventLog?.LogCloseMiss(t.targetType);
                 }
             }
         }
     }
 
-    /// <summary>
-    /// Called by ShooterBullet on collision with a target.
-    /// Records the hit and either schedules respawn (if round active) or
-    /// simply deactivates the target.
-    /// </summary>
+    /// <summary>Called by ShooterBullet on collision with a target.</summary>
     public void HandleBulletHit(ShooterTarget target, int points)
     {
         if (CurrentState == RoundState.Active)
         {
             float timeToHit = Mathf.Max(0f, Time.time - target.LastSpawnTime);
-            stats.RecordHit(target.targetType, points, timeToHit);
+            bool wasRotating = target.rotationSpeed != RotationSpeed.None;
+            stats.RecordHit(target.targetType, wasRotating, points, timeToHit);
             eventLog?.LogShotHit(target.targetType, points, timeToHit, target.transform.position);
             hud?.UpdateScore(stats.totalPoints, points);
             targetManager?.ScheduleRespawn(target);
         }
         else
         {
-            // Round over — just hide the target
             target.gameObject.SetActive(false);
         }
     }
 
-    // ── Private ───────────────────────────────────────────────────────────────
+    /// <summary>Called by ShooterTargetManager when a target's lifespan expires.</summary>
+    public void HandleTargetExpired(ShooterTarget target)
+    {
+        if (CurrentState != RoundState.Active) return;
+        bool wasRotating = target.rotationSpeed != RotationSpeed.None;
+        stats.RecordExpired(target.targetType, wasRotating);
+        eventLog?.LogTargetDespawned(target.targetType);
+    }
+
+    // ── Private ─────────────────────────────────────────────────────────────
 
     void EndRound()
     {
@@ -183,14 +177,17 @@ public class ShooterRoundManager : MonoBehaviour
         flowAgent?.OnRoundEnd();
         adaptiveController?.OnRoundEnd();
         ExportRoundReport();
-        hud?.SetRoundState(RoundState.Results, stats);
+
+        string summary = adaptiveController?.lastRoundSummary;
+        string explain = adaptiveController?.lastUpdateExplanation;
+        hud?.SetRoundState(RoundState.Results, stats, summary, explain);
         SetStartButtonVisible(true);
         StartCoroutine(DespawnThenIdle());
     }
 
     void ExportRoundReport()
     {
-        if (trainingMode) return; // avoid disk spam during offline training
+        if (trainingMode) return;
 
         var session = FindObjectOfType<PlayerSessionManager>();
         string player = session != null ? session.CurrentPlayerName : "";
@@ -198,7 +195,6 @@ public class ShooterRoundManager : MonoBehaviour
         ShooterRoundReport report = ShooterRoundReport.FromStats(stats, player, roundDuration);
         report.SaveToDisk();
         eventLog?.SaveToDisk(string.IsNullOrEmpty(player) ? "anonymous" : player);
-        Debug.Log("[Shooter] Round report:\n" + report.ToJson());
     }
 
     IEnumerator DespawnThenIdle()
@@ -207,10 +203,7 @@ public class ShooterRoundManager : MonoBehaviour
         targetManager?.DespawnAllTargets();
 
         if (!trainingMode)
-        {
-            // Small grace period so the results panel is clearly shown
             yield return new WaitForSeconds(0.5f);
-        }
 
         CurrentState = RoundState.Idle;
         SetStartButtonVisible(true);

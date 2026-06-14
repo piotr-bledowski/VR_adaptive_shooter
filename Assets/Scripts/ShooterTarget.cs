@@ -2,33 +2,35 @@ using UnityEngine;
 
 public enum TargetType { Stationary, Moving, Erratic }
 
-/// <summary>
-/// A shooting-range target.  Three movement modes:
-///   Stationary — sits still at its placed position.
-///   Moving     — slides back-and-forth along a straight path.
-///   Erratic    — Lissajous-style 3-axis sine trajectory: circles, curves,
-///                depth changes — full 3D freedom.
-/// Managed (spawn / despawn / respawn) by ShooterTargetManager.
-/// </summary>
+public enum RotationSpeed { None = 0, Slow = 1, Medium = 2, Fast = 3 }
+
 public class ShooterTarget : MonoBehaviour
 {
     [Header("Identity")]
     public TargetType targetType = TargetType.Moving;
 
     [Header("Scoring (distance from centre → points)")]
-    public int   centerPoints = 100;
-    public int   innerPoints  =  60;
-    public int   middlePoints =  30;
-    public int   outerPoints  =  10;
+    public int   centerPoints = 10;
+    public int   innerPoints  =  5;
+    public int   middlePoints =  2;
+    public int   outerPoints  =  1;
     public float targetRadius = 0.5f;
 
-    // ── Moving ────────────────────────────────────────────────────────────────
+    [Header("Rotation")]
+    public RotationSpeed rotationSpeed = RotationSpeed.None;
+
+    [Header("Lifespan")]
+    public float lifespan = 5f;
+
+    public System.Action<ShooterTarget> OnLifespanExpired;
+
+    // ── Moving ──────────────────────────────────────────────────────────────
     [Header("Moving")]
     public Vector3 pointA;
     public Vector3 pointB;
     public float   moveSpeed = 2f;
 
-    // ── Erratic ───────────────────────────────────────────────────────────────
+    // ── Erratic ─────────────────────────────────────────────────────────────
     [Header("Erratic")]
     [Tooltip("World-space centre of the erratic trajectory.")]
     public Vector3 erraticCenter;
@@ -39,21 +41,20 @@ public class ShooterTarget : MonoBehaviour
     [Tooltip("Phase offset on each axis (randomised on enable).")]
     public Vector3 erraticPhase;
 
-    // ── Private state ─────────────────────────────────────────────────────────
+    // ── Private state ───────────────────────────────────────────────────────
     private float _t;
     private int   _dir = 1;
     private float _time;
+    private float _rotationDegreesPerSec;
 
-    /// <summary>Time.time when this target was last activated (spawn or respawn).</summary>
     public float LastSpawnTime { get; private set; }
 
-    // ── Unity events ──────────────────────────────────────────────────────────
+    // ── Unity events ────────────────────────────────────────────────────────
 
     void OnEnable()
     {
         LastSpawnTime = Time.time;
 
-        // Randomise phase/position so targets don't all start at the same point
         _t    = Random.Range(0f, 1f);
         _dir  = Random.value > 0.5f ? 1 : -1;
         _time = Random.Range(0f, 200f);
@@ -62,16 +63,28 @@ public class ShooterTarget : MonoBehaviour
             Random.Range(0f, Mathf.PI * 2f),
             Random.Range(0f, Mathf.PI * 2f),
             Random.Range(0f, Mathf.PI * 2f));
+
+        transform.rotation = Quaternion.Euler(0f, 180f, 0f);
+        SetRotation(rotationSpeed);
     }
 
     void Update()
     {
+        if (Time.time - LastSpawnTime >= lifespan)
+        {
+            OnLifespanExpired?.Invoke(this);
+            gameObject.SetActive(false);
+            return;
+        }
+
         switch (targetType)
         {
             case TargetType.Moving:  UpdateMoving();  break;
             case TargetType.Erratic: UpdateErratic(); break;
-            // Stationary: nothing
         }
+
+        if (rotationSpeed != RotationSpeed.None)
+            transform.Rotate(0f, _rotationDegreesPerSec * Time.deltaTime, 0f, Space.Self);
     }
 
     void UpdateMoving()
@@ -92,7 +105,19 @@ public class ShooterTarget : MonoBehaviour
             erraticCenter.z + erraticAmplitude.z * Mathf.Sin(erraticFrequency.z * _time + erraticPhase.z));
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Public API ──────────────────────────────────────────────────────────
+
+    public void SetRotation(RotationSpeed speed)
+    {
+        rotationSpeed = speed;
+        switch (speed)
+        {
+            case RotationSpeed.Slow:   _rotationDegreesPerSec = 45f;  break;
+            case RotationSpeed.Medium: _rotationDegreesPerSec = 120f; break;
+            case RotationSpeed.Fast:   _rotationDegreesPerSec = 240f; break;
+            default:                   _rotationDegreesPerSec = 0f;   break;
+        }
+    }
 
     public int CalculatePoints(Vector3 hitWorldPos)
     {
@@ -106,7 +131,6 @@ public class ShooterTarget : MonoBehaviour
         return outerPoints;
     }
 
-    /// <summary>Configure a moving path (called by target manager at spawn).</summary>
     public void SetMovingPath(Vector3 a, Vector3 b, float speed)
     {
         pointA = a; pointB = b; moveSpeed = speed;
@@ -115,13 +139,11 @@ public class ShooterTarget : MonoBehaviour
         transform.position = Vector3.Lerp(a, b, _t);
     }
 
-    /// <summary>Configure erratic parameters (called by target manager at spawn).</summary>
     public void SetErraticParams(Vector3 centre, Vector3 amplitude, Vector3 frequency)
     {
         erraticCenter    = centre;
         erraticAmplitude = amplitude;
         erraticFrequency = frequency;
-        // Phase is randomised again in OnEnable, but also set it here defensively
         erraticPhase = new Vector3(
             Random.Range(0f, Mathf.PI * 2f),
             Random.Range(0f, Mathf.PI * 2f),

@@ -4,8 +4,10 @@ using UnityEngine.UI;
 
 /// <summary>
 /// VR skill prompt shown when a new player enters their name for the first time.
-/// Asks "How experienced are you?" with 3 buttons. Initializes their profile
-/// from the corresponding pretrained model (beginner/intermediate/advanced).
+/// Asks "How experienced are you?" with 3 buttons.
+/// The chosen level seeds the initial EMA estimates and Q-table bias
+/// (so the agent starts in a reasonable region of action space), but the
+/// Q-table is always freshly initialised — it learns purely from this player's play.
 /// </summary>
 public class SkillPromptUI : MonoBehaviour
 {

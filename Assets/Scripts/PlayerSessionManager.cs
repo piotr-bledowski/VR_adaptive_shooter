@@ -83,9 +83,10 @@ public class PlayerSessionManager : MonoBehaviour
     void OnSkillSelected(PlayerSkillLevel level)
     {
         PlayerRegistry.AddPlayerIfNew(CurrentPlayerName);
-        // Load Q-table from offline-trained base profile if available,
-        // otherwise fall back to hand-seeded defaults.
-        var profile = PlayerSkillProfile.CreateFromBase(CurrentPlayerName, level);
+        // Always start fresh — the chosen skill level seeds the initial EMA estimates
+        // and Q-table bias so the agent begins in a sensible region of action space,
+        // but the Q-table itself is uninformed (learns purely from this player's play).
+        var profile = PlayerSkillProfile.CreateNew(CurrentPlayerName, level);
         profile.Save();
         LoadProfileAndEnterGameplay(profile);
     }

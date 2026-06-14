@@ -222,7 +222,7 @@ public class ShooterFlowAgent : Agent
     bool SpawnTargetAtPosition(TargetType type, Vector3 position)
     {
         if (targetManager == null) return false;
-        return targetManager.SpawnSingleTarget(type, position);
+        return targetManager.SpawnSingleTarget(type, RotationSpeed.None, position);
     }
 
     Vector3 GridToWorldPosition(int xZone, int yZone, int zZone)

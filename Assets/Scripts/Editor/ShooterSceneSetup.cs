@@ -108,6 +108,8 @@ public static class ShooterSceneSetup
 
         roundMgr.eventLog           = eventLog;
         roundMgr.adaptiveController = adaptive;
+        tgtMgr.adaptiveController   = adaptive;
+        tgtMgr.eventLog             = eventLog;
 
         // Skill prompt (scene root, not child of lobby — must stay visible independently)
         GameObject promptObj = new GameObject("SkillPrompt");
@@ -624,16 +626,11 @@ public static class ShooterSceneSetup
     {
         GameObject go = new GameObject("TargetManager");
         ShooterTargetManager mgr = go.AddComponent<ShooterTargetManager>();
-        mgr.targetPrefab   = targetPrefab;
-        mgr.areaCenter     = TARGET_AREA_CENTER;
-        mgr.areaSize       = TARGET_AREA_SIZE;
-        mgr.stationaryCount       = 4;
-        mgr.movingCount           = 4;
-        mgr.erraticCount          = 4;
-        mgr.maxConcurrentTargets  = 10;
-        mgr.minSpawnInterval      = 0.8f;
-        mgr.maxSpawnInterval      = 2.5f;
-        mgr.respawnDelay          = 5f;
+        mgr.targetPrefab = targetPrefab;
+        mgr.areaCenter   = TARGET_AREA_CENTER;
+        mgr.areaSize     = TARGET_AREA_SIZE;
+        mgr.poolSize     = 12;
+        mgr.spawnDelay   = 3f;
 
         EditorUtility.SetDirty(go);
         return go;
@@ -695,8 +692,8 @@ public static class ShooterSceneSetup
         canvasObj.transform.SetParent(lobbyRoot, false);
         canvasObj.transform.position   = new Vector3(0f, 1.55f, 4.74f);
         canvasObj.transform.rotation   = Quaternion.Euler(0f, 180f, 0f);
-        // Negative X un-mirrors uGUI text when canvas faces the player (180° Y)
-        canvasObj.transform.localScale = new Vector3(-lobbyCanvasScale, lobbyCanvasScale, lobbyCanvasScale);
+        // Positive scale — mirroring is handled by the ContentFlipRoot child below.
+        canvasObj.transform.localScale = new Vector3(lobbyCanvasScale, lobbyCanvasScale, lobbyCanvasScale);
 
         Canvas canvas = canvasObj.AddComponent<Canvas>();
         canvas.renderMode = RenderMode.WorldSpace;
@@ -706,25 +703,38 @@ public static class ShooterSceneSetup
         RectTransform canvasRt = canvasObj.GetComponent<RectTransform>();
         canvasRt.sizeDelta = new Vector2(1200f, 800f);
 
-        Text titleText = CreateLobbyText(canvasObj.transform, "TitleText", "WHO IS PLAYING?",
+        // ContentFlipRoot: -X scale so that all uGUI text sits in a coordinate space that
+        // cancels the glyph-mirror produced by the canvas's 180° Y rotation.
+        // Layout is preserved: left anchor still appears on the player's left.
+        GameObject contentFlipObj = new GameObject("ContentFlipRoot");
+        contentFlipObj.transform.SetParent(canvasObj.transform, false);
+        RectTransform contentFlipRt = contentFlipObj.AddComponent<RectTransform>();
+        contentFlipRt.anchorMin  = Vector2.zero;
+        contentFlipRt.anchorMax  = Vector2.one;
+        contentFlipRt.offsetMin  = Vector2.zero;
+        contentFlipRt.offsetMax  = Vector2.zero;
+        contentFlipRt.localScale = new Vector3(-1f, 1f, 1f);
+
+        // All lobby text is parented to contentFlipObj (inside the flip root).
+        Text titleText = CreateLobbyText(contentFlipObj.transform, "TitleText", "WHO IS PLAYING?",
             font, 38, FontStyle.Bold, TextAnchor.UpperCenter,
             new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -25f), new Vector2(900f, 60f));
 
-        Text hintText = CreateLobbyText(canvasObj.transform, "HintText",
+        Text hintText = CreateLobbyText(contentFlipObj.transform, "HintText",
             "Select a saved player or type a new name on the keyboard.",
             font, 20, FontStyle.Normal, TextAnchor.UpperCenter,
             new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -80f), new Vector2(1000f, 50f));
         hintText.color = new Color(0.85f, 0.9f, 1f);
 
-        Text listHeader = CreateLobbyText(canvasObj.transform, "ListHeader", "SAVED PLAYERS",
+        Text listHeader = CreateLobbyText(contentFlipObj.transform, "ListHeader", "SAVED PLAYERS",
             font, 22, FontStyle.Bold, TextAnchor.UpperLeft,
             new Vector2(0f, 1f), new Vector2(0f, 1f), new Vector2(40f, -140f), new Vector2(400f, 32f));
 
-        Text nameLabel = CreateLobbyText(canvasObj.transform, "NameLabel", "YOUR NAME",
+        Text nameLabel = CreateLobbyText(contentFlipObj.transform, "NameLabel", "YOUR NAME",
             font, 22, FontStyle.Bold, TextAnchor.UpperRight,
             new Vector2(1f, 1f), new Vector2(1f, 1f), new Vector2(-40f, -140f), new Vector2(400f, 32f));
 
-        Text nameDisplay = CreateLobbyText(canvasObj.transform, "NameDisplay", "_",
+        Text nameDisplay = CreateLobbyText(contentFlipObj.transform, "NameDisplay", "_",
             font, 34, FontStyle.Bold, TextAnchor.MiddleRight,
             new Vector2(1f, 1f), new Vector2(1f, 1f), new Vector2(-40f, -195f), new Vector2(500f, 55f));
         nameDisplay.color = new Color(0.3f, 1f, 0.5f);
@@ -733,10 +743,10 @@ public static class ShooterSceneSetup
         GameObject listContainer = new GameObject("PlayerListContainer");
         listContainer.transform.SetParent(lobbyRoot, false);
         listContainer.transform.position = new Vector3(-1.2f, 1.35f, 4.76f);
-        Vector3 listFaceDir = new Vector3(0f, 1.35f, 3f) - listContainer.transform.position;
-        listFaceDir.y = 0f;
-        if (listFaceDir.sqrMagnitude > 0.01f)
-            listContainer.transform.rotation = Quaternion.LookRotation(listFaceDir.normalized, Vector3.up);
+        // Use the same 180° Y rotation as the lobby canvas so the container's +X axis
+        // is world -X.  Combined with the 180° Y rotation on each label, this makes
+        // text read left-to-right from the player's perspective without any -X scale trick.
+        listContainer.transform.rotation = Quaternion.Euler(0f, 180f, 0f);
 
         GameObject listEntryPrefab = CreatePlayerListEntryPrefab(listEntryMat, font);
 
@@ -958,7 +968,10 @@ public static class ShooterSceneSetup
         GameObject labelGo = new GameObject("Label");
         labelGo.transform.SetParent(root, false);
         labelGo.transform.localPosition = new Vector3(0f, 0f, bodyDepth * 0.5f + 0.004f);
-        labelGo.transform.localRotation = Quaternion.identity;
+        // 180° Y puts the TextMesh -Z face toward the player.
+        // No -X scale needed: the list container is already rotated 180° Y, so its +X = world -X,
+        // and the double-flip gives correct left-to-right text without an extra mirror step.
+        labelGo.transform.localRotation = Quaternion.Euler(0f, 180f, 0f);
         labelGo.transform.localScale    = Vector3.one;
 
         int   len      = Mathf.Max(1, text.Length);
@@ -1049,7 +1062,7 @@ public static class ShooterSceneSetup
         if (eye != null)
         {
             canvasObj.transform.SetParent(eye, false);
-            canvasObj.transform.localPosition = new Vector3(0f, 0f, 0.5f);
+            canvasObj.transform.localPosition = new Vector3(0f, 0f, 0.8f);
             canvasObj.transform.localRotation = Quaternion.identity;
         }
 
@@ -1289,12 +1302,22 @@ public static class ShooterSceneSetup
 
         RectTransform canvasRect = canvasObj.GetComponent<RectTransform>();
         canvasRect.sizeDelta     = new Vector2(600, 400);
-        canvasRect.localScale    = new Vector3(-0.002f, 0.002f, 0.002f);
+        canvasRect.localScale    = new Vector3(0.002f, 0.002f, 0.002f); // positive; flip via ContentFlipRoot
         canvasRect.localPosition = Vector3.zero;
+
+        // ContentFlipRoot cancels the glyph-mirror from the canvas's 180° Y rotation.
+        GameObject skillFlipObj = new GameObject("ContentFlipRoot");
+        skillFlipObj.transform.SetParent(canvasObj.transform, false);
+        RectTransform skillFlipRt = skillFlipObj.AddComponent<RectTransform>();
+        skillFlipRt.anchorMin  = Vector2.zero;
+        skillFlipRt.anchorMax  = Vector2.one;
+        skillFlipRt.offsetMin  = Vector2.zero;
+        skillFlipRt.offsetMax  = Vector2.zero;
+        skillFlipRt.localScale = new Vector3(-1f, 1f, 1f);
 
         // Background panel
         GameObject bg = new GameObject("Background");
-        bg.transform.SetParent(canvasObj.transform, false);
+        bg.transform.SetParent(skillFlipObj.transform, false);
         Image bgImg = bg.AddComponent<Image>();
         bgImg.color = new Color(0.1f, 0.1f, 0.15f, 0.92f);
         RectTransform bgRect = bg.GetComponent<RectTransform>();
@@ -1307,7 +1330,7 @@ public static class ShooterSceneSetup
 
         // Title
         GameObject titleObj = new GameObject("Title");
-        titleObj.transform.SetParent(canvasObj.transform, false);
+        titleObj.transform.SetParent(skillFlipObj.transform, false);
         Text title = titleObj.AddComponent<Text>();
         title.font      = font;
         title.fontSize  = 36;
@@ -1323,7 +1346,7 @@ public static class ShooterSceneSetup
 
         // Description
         GameObject descObj = new GameObject("Description");
-        descObj.transform.SetParent(canvasObj.transform, false);
+        descObj.transform.SetParent(skillFlipObj.transform, false);
         Text desc = descObj.AddComponent<Text>();
         desc.font      = font;
         desc.fontSize  = 22;
@@ -1337,12 +1360,12 @@ public static class ShooterSceneSetup
         descRect.offsetMax     = Vector2.zero;
         promptUI.descriptionText = desc;
 
-        // Buttons
-        promptUI.beginnerButton     = CreatePromptButton(canvasObj.transform, "Beginner",
+        // Buttons — parented inside the flip root so their labels are also un-mirrored.
+        promptUI.beginnerButton     = CreatePromptButton(skillFlipObj.transform, "Beginner",
             new Color(0.2f, 0.6f, 0.3f), new Vector2(0.05f, 0.15f), new Vector2(0.32f, 0.48f), font);
-        promptUI.intermediateButton = CreatePromptButton(canvasObj.transform, "Intermediate",
+        promptUI.intermediateButton = CreatePromptButton(skillFlipObj.transform, "Intermediate",
             new Color(0.5f, 0.5f, 0.15f), new Vector2(0.35f, 0.15f), new Vector2(0.65f, 0.48f), font);
-        promptUI.advancedButton     = CreatePromptButton(canvasObj.transform, "Advanced",
+        promptUI.advancedButton     = CreatePromptButton(skillFlipObj.transform, "Advanced",
             new Color(0.6f, 0.2f, 0.2f), new Vector2(0.68f, 0.15f), new Vector2(0.95f, 0.48f), font);
 
         // panelRoot points to the canvas CHILD, not to promptObj itself.
@@ -1411,5 +1434,26 @@ public static class ShooterSceneSetup
         if (scenes.Any(s => s.path == scenePath)) return;
         scenes.Add(new EditorBuildSettingsScene(scenePath, true));
         EditorBuildSettings.scenes = scenes.ToArray();
+    }
+}
+
+/// <summary>
+/// Editor-only debug helpers accessible from the MGU menu bar.
+/// </summary>
+static class MGUDebugMenus
+{
+    [UnityEditor.MenuItem("MGU/Debug/Clear All Player Data (Editor Device)")]
+    static void ClearAllPlayerData()
+    {
+        if (!UnityEditor.EditorUtility.DisplayDialog(
+                "Clear All Player Data",
+                "This will delete saved_players.json and all shooter_profiles on the currently " +
+                "active device (Editor / connected headset via USB).\n\nContinue?",
+                "Delete", "Cancel"))
+            return;
+
+        PlayerRegistry.ClearAll();
+        UnityEditor.EditorUtility.DisplayDialog("Done",
+            "Player data cleared.\nPath: " + UnityEngine.Application.persistentDataPath, "OK");
     }
 }

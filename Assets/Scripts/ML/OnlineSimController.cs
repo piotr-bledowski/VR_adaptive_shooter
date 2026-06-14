@@ -5,23 +5,9 @@ using System.IO;
 using UnityEngine;
 
 /// <summary>
-/// Simulates a full online player session — the same adaptive Q-learning loop that runs
-/// during real VR gameplay — using a SyntheticPlayer instead of a human.
-///
-/// Key differences from TrainingRoundController (which produces base profiles):
-///   - Profile is initialised via CreateFromBase(), exactly as a new real player's profile is.
-///   - Profile name does NOT start with "_training_", so AdaptiveSpawnController saves it to
-///     disk after every round — identical to the live game.
-///   - Only 25 rounds (a realistic session length) rather than 200.
-///
-/// Workflow:
-///   1. Run ShooterTraining.unity first to produce _base_*.json profiles.
-///   2. Open ShooterOnlineSim.unity and press Play.
-///   3. Read the console logs or the JSON report in
-///      Application.persistentDataPath/shooter_sim_reports/ to inspect how difficulty adapts.
-///
-/// If no base profiles exist yet, CreateFromBase falls back to hand-seeded defaults —
-/// the simulation still runs, but will start from a cold Q-table.
+/// Simulates a full online player session using SyntheticPlayer.
+/// Profile initialised via CreateFromBase (same as a real new player).
+/// Saves the profile after every round — identical to live gameplay.
 /// </summary>
 public class OnlineSimController : MonoBehaviour
 {
@@ -31,16 +17,10 @@ public class OnlineSimController : MonoBehaviour
     public ShooterEventLog         eventLog;
 
     [Header("Simulation settings")]
-    [Tooltip("Time.timeScale during simulation (8–12 recommended for fast results).")]
     public float simulationTimeScale = 8f;
-    [Tooltip("Number of rounds to simulate. 25 approximates a realistic play session.")]
     public int   roundsToSimulate    = 25;
-    [Tooltip("Seconds real-time between rounds.")]
     public float interRoundDelay     = 0.05f;
-    [Tooltip("Skill level this environment represents.")]
     public PlayerSkillLevel skillLevel = PlayerSkillLevel.Intermediate;
-
-    // ── State ─────────────────────────────────────────────────────────────────
 
     int   _roundsCompleted;
     bool  _running = true;
@@ -48,11 +28,8 @@ public class OnlineSimController : MonoBehaviour
     float _bestReward  = float.NegativeInfinity;
     int   _bestRound;
 
-    readonly List<RoundRecord> _history = new List<RoundRecord>();
-
+    readonly List<TrainingRoundRecord> _history = new List<TrainingRoundRecord>();
     static int s_activeControllers;
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     void Awake()
     {
@@ -68,25 +45,19 @@ public class OnlineSimController : MonoBehaviour
 
     void Start()
     {
-        // Initialise exactly as the real game does for a brand-new player.
-        // CreateFromBase clones the trained Q-table from _base_<skill>.json;
-        // if that file doesn't exist yet it falls back to hand-seeded defaults.
         string playerName = $"sim_{skillLevel.ToString().ToLower()}";
         var profile = PlayerSkillProfile.CreateFromBase(playerName, skillLevel);
         adaptiveController.activeProfile = profile;
 
         Debug.Log($"[OnlineSim:{skillLevel}] Starting {roundsToSimulate}-round session " +
-                  $"as '{playerName}' (ε={profile.epsilon:F2}, " +
-                  $"hitRate₀={profile.emaHitRate:F2}, TTH₀={profile.emaTimeToHit:F1}s)");
+                  $"as '{playerName}' (ε={profile.epsilon:F2})");
 
         StartCoroutine(SimLoop());
     }
 
-    // ── Simulation loop ───────────────────────────────────────────────────────
-
     IEnumerator SimLoop()
     {
-        yield return null; // let all Awake/Start hooks complete
+        yield return null;
 
         while (_running)
         {
@@ -100,7 +71,6 @@ public class OnlineSimController : MonoBehaviour
             while (roundManager.CurrentState == RoundState.Active)
                 yield return null;
 
-            // Wait for DespawnThenIdle coroutine inside RoundManager to finish
             while (roundManager.CurrentState != RoundState.Idle)
                 yield return null;
 
@@ -118,38 +88,54 @@ public class OnlineSimController : MonoBehaviour
     {
         _roundsCompleted++;
 
-        // By this point AdaptiveSpawnController.OnRoundEnd() has already:
-        //   - computed hitRate and avgTTH from the event log
-        //   - called profile.UpdateAfterRound() (Q-table Bellman update + EMA)
-        //   - saved the profile to disk (because name != "_training_*")
-        // This is identical to what happens after every round in the live game.
-
         var profile = adaptiveController.activeProfile;
         if (profile == null) return;
 
-        float hitRate = eventLog != null ? eventLog.CurrentHitRate : 0f;
-        float avgTTH  = AvgTimeToHit();
-        float reward  = PlayerSkillProfile.ComputeFlowReward(hitRate, avgTTH);
+        var s = roundManager.stats;
+        float hitRate = s.HitRate;
+        float avgTTH = AvgTimeToHit();
+        float ppt = s.totalTargetsSpawned > 0 ? (float)s.totalPoints / s.totalTargetsSpawned : 0f;
+
+        float reward = PlayerSkillProfile.ComputeFlowReward(
+            hitRate, avgTTH, ppt,
+            s.stationary.HitRate, s.moving.HitRate, s.erratic.HitRate);
 
         _totalReward += reward;
         if (reward > _bestReward) { _bestReward = reward; _bestRound = _roundsCompleted; }
 
-        _history.Add(new RoundRecord
+        PlayerSkillProfile.DecodeAction(adaptiveController.currentAction,
+            out int emphType, out int rotLvl, out int pace);
+
+        _history.Add(new TrainingRoundRecord
         {
-            round        = _roundsCompleted,
-            preset       = adaptiveController.currentPresetName,
-            action       = adaptiveController.currentAction,
-            hitRate      = profile.emaHitRate,
-            avgTimeToHit = profile.emaTimeToHit,
-            reward       = reward,
-            epsilon      = profile.epsilon,
-            qState       = profile.GetCurrentState()
+            round              = _roundsCompleted,
+            action             = adaptiveController.currentAction,
+            emphasisType       = emphType,
+            rotationLevel      = rotLvl,
+            spawnPace          = pace,
+            actionDesc         = adaptiveController.currentActionDescription ?? "",
+            hitRate            = hitRate,
+            avgTimeToHit       = avgTTH,
+            pointsPerTarget    = ppt,
+            totalPoints        = s.totalPoints,
+            targetsSpawned     = s.totalTargetsSpawned,
+            expired            = s.totalExpired,
+            hitRateStat        = s.stationary.HitRate,
+            hitRateMov         = s.moving.HitRate,
+            hitRateErr         = s.erratic.HitRate,
+            hitRateRot         = s.rotating.HitRate,
+            ptsPerHitStat      = s.stationary.AvgPointsPerHit,
+            ptsPerHitMov       = s.moving.AvgPointsPerHit,
+            ptsPerHitErr       = s.erratic.AvgPointsPerHit,
+            reward             = reward,
+            epsilon            = profile.epsilon,
+            qState             = profile.GetCurrentState()
         });
 
         Debug.Log($"[OnlineSim:{skillLevel}] {_roundsCompleted}/{roundsToSimulate} | " +
-                  $"preset={adaptiveController.currentPresetName,-9} | " +
-                  $"hitRate={profile.emaHitRate:F2}  TTH={profile.emaTimeToHit:F1}s | " +
-                  $"reward={reward:F2}  ε={profile.epsilon:F3}  state={profile.GetCurrentState()}");
+                  $"{adaptiveController.currentActionDescription} | " +
+                  $"hit={hitRate:F2} TTH={avgTTH:F1}s ppt={ppt:F1} | " +
+                  $"reward={reward:F2} ε={profile.epsilon:F3}");
     }
 
     void Finish()
@@ -160,13 +146,11 @@ public class OnlineSimController : MonoBehaviour
             Time.timeScale = 1f;
 
         float avg = _totalReward / Mathf.Max(1, _roundsCompleted);
-        Debug.Log($"[OnlineSim:{skillLevel}] COMPLETE — {_roundsCompleted} rounds | " +
-                  $"avg reward={avg:F2} | best={_bestReward:F2} at round {_bestRound}");
+        Debug.Log($"[OnlineSim:{skillLevel}] COMPLETE — {_roundsCompleted} rounds, " +
+                  $"avg reward={avg:F2}");
 
         SaveReport();
     }
-
-    // ── Report ────────────────────────────────────────────────────────────────
 
     void SaveReport()
     {
@@ -174,9 +158,9 @@ public class OnlineSimController : MonoBehaviour
         Directory.CreateDirectory(dir);
 
         string ts   = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        string path = Path.Combine(dir, $"sim_{skillLevel.ToString().ToLower()}_{ts}.json");
+        string baseName = $"sim_{skillLevel.ToString().ToLower()}_{ts}";
 
-        var report = new SimReport
+        var report = new TrainingReport
         {
             skillLevel  = skillLevel.ToString(),
             totalRounds = _roundsCompleted,
@@ -186,8 +170,28 @@ public class OnlineSimController : MonoBehaviour
             rounds      = _history.ToArray()
         };
 
-        File.WriteAllText(path, JsonUtility.ToJson(report, true));
-        Debug.Log($"[OnlineSim:{skillLevel}] Session report → {path}");
+        string jsonPath = Path.Combine(dir, baseName + ".json");
+        File.WriteAllText(jsonPath, JsonUtility.ToJson(report, true));
+
+        // CSV for easy plotting
+        string csvPath = Path.Combine(dir, baseName + ".csv");
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("round,action,emphType,rotLevel,pace,hitRate,avgTTH,ppt,totalPts," +
+                      "spawned,expired,hrStat,hrMov,hrErr,hrRot,pphStat,pphMov,pphErr," +
+                      "reward,epsilon,qState");
+        foreach (var r in _history)
+        {
+            sb.AppendLine($"{r.round},{r.action},{r.emphasisType},{r.rotationLevel},{r.spawnPace}," +
+                          $"{r.hitRate:F4},{r.avgTimeToHit:F3},{r.pointsPerTarget:F3},{r.totalPoints}," +
+                          $"{r.targetsSpawned},{r.expired}," +
+                          $"{r.hitRateStat:F4},{r.hitRateMov:F4},{r.hitRateErr:F4},{r.hitRateRot:F4}," +
+                          $"{r.ptsPerHitStat:F3},{r.ptsPerHitMov:F3},{r.ptsPerHitErr:F3}," +
+                          $"{r.reward:F4},{r.epsilon:F4},{r.qState}");
+        }
+        File.WriteAllText(csvPath, sb.ToString());
+
+        Debug.Log($"[OnlineSim:{skillLevel}] Report → {jsonPath}");
+        Debug.Log($"[OnlineSim:{skillLevel}] CSV    → {csvPath}");
     }
 
     float AvgTimeToHit()
@@ -207,30 +211,4 @@ public class OnlineSimController : MonoBehaviour
         }
         return cnt > 0 ? sum / cnt : 2.5f;
     }
-}
-
-// ── Serialisable data types (outside MonoBehaviour for JsonUtility compatibility) ──
-
-[Serializable]
-public class SimReport
-{
-    public string   skillLevel;
-    public int      totalRounds;
-    public float    avgReward;
-    public float    bestReward;
-    public int      bestRound;
-    public RoundRecord[] rounds;
-}
-
-[Serializable]
-public struct RoundRecord
-{
-    public int    round;
-    public string preset;
-    public int    action;
-    public float  hitRate;
-    public float  avgTimeToHit;
-    public float  reward;
-    public float  epsilon;
-    public int    qState;
 }

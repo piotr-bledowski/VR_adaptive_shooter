@@ -145,15 +145,21 @@ public class ShooterBullet : MonoBehaviour
 
         if (target != null)
         {
-            if (points >= target.centerPoints)
+            if (points >= target.centerPoints) // bullseye (10)
             {
                 intensity  = impactLightIntensityBullseye;
                 lightColor = new Color(1f, 0.06f, 0.02f);
                 sparkColor = new Color(1f, 0.15f, 0.05f);
             }
-            else
+            else if (points >= target.innerPoints) // inner ring (5)
             {
                 intensity  = impactLightIntensityTarget;
+                lightColor = new Color(1f, 0.6f, 0.05f);
+                sparkColor = new Color(1f, 0.65f, 0.10f);
+            }
+            else
+            {
+                intensity  = impactLightIntensityTarget * 0.6f;
                 lightColor = new Color(1f, 0.95f, 0.12f);
                 sparkColor = new Color(1f, 0.92f, 0.18f);
             }

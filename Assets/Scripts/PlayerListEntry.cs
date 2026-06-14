@@ -48,8 +48,10 @@ public class PlayerListEntry : MonoBehaviour, IVRPointerTarget
     }
 
     /// <summary>
-    /// Label on the +Z face (toward the player). List container is pre-rotated to face spawn;
-    /// do not billboard individual entries — that flips the text.
+    /// Label on the +Z face of the button body. The list container uses Euler(0,180,0) so
+    /// its local +X = world -X.  A 180° Y rotation on the label then makes its -Z face the
+    /// player AND its +X map back to world +X, giving correct left-to-right text without
+    /// any additional -X scale flip.
     /// </summary>
     void FixLabelMirror(string nameForSizing = null)
     {
@@ -61,7 +63,7 @@ public class PlayerListEntry : MonoBehaviour, IVRPointerTarget
 
         Transform label = _meshLabel.transform;
         label.localPosition = new Vector3(0f, 0f, depth * 0.5f + 0.004f);
-        label.localRotation = Quaternion.identity;
+        label.localRotation = Quaternion.Euler(0f, 180f, 0f);
         label.localScale    = Vector3.one;
 
         string text = nameForSizing ?? _meshLabel.text;

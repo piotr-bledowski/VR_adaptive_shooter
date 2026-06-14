@@ -77,6 +77,33 @@ public static class PlayerRegistry
         return true;
     }
 
+    /// <summary>
+    /// Deletes the player list file and all skill-profile JSON files on this device.
+    /// Called from the MGU / Debug menu in the Editor, or from a runtime debug button.
+    /// </summary>
+    public static void ClearAll()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+            {
+                File.Delete(FilePath);
+                Debug.Log("[PlayerRegistry] Deleted " + FilePath);
+            }
+
+            string profileDir = Path.Combine(Application.persistentDataPath, "shooter_profiles");
+            if (Directory.Exists(profileDir))
+            {
+                Directory.Delete(profileDir, recursive: true);
+                Debug.Log("[PlayerRegistry] Deleted profile directory: " + profileDir);
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[PlayerRegistry] ClearAll failed: " + ex.Message);
+        }
+    }
+
     static void SavePlayers(List<string> players)
     {
         try
