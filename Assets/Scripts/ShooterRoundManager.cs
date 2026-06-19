@@ -33,12 +33,16 @@ public class ShooterRoundManager : MonoBehaviour
     public ShooterEventLog         eventLog;
     public ShooterFlowAgent        flowAgent;
     public AdaptiveSpawnController adaptiveController;
+    public DifficultyFeedbackUI    feedbackUI;
 
     [Header("Live stats (read-only in Inspector)")]
     public ShooterStats stats = new ShooterStats();
 
     public RoundState CurrentState  { get; set; } = RoundState.Idle;
     public float      TimeRemaining { get; set; }
+
+    /// <summary>True between round end and the player submitting a difficulty rating.</summary>
+    public bool AwaitingFeedback { get; private set; }
 
     public IReadOnlyList<ShooterTarget> ActiveTargets =>
         targetManager != null ? targetManager.ActiveTargetsList
@@ -175,14 +179,46 @@ public class ShooterRoundManager : MonoBehaviour
         targetManager?.StopSpawning();
         eventLog?.EndRound();
         flowAgent?.OnRoundEnd();
-        adaptiveController?.OnRoundEnd();
-        ExportRoundReport();
 
-        string summary = adaptiveController?.lastRoundSummary;
-        string explain = adaptiveController?.lastUpdateExplanation;
-        hud?.SetRoundState(RoundState.Results, stats, summary, explain);
+        // Snapshot the round's metrics, but DON'T learn yet — the Q-update waits
+        // until the player rates the round's difficulty.
+        adaptiveController?.CaptureRoundMetrics();
+
+        // Show the round stats immediately; the agent's verdict is appended once rated.
+        hud?.SetRoundState(RoundState.Results, stats, null, null);
+
+        AwaitingFeedback = true;
+        SetStartButtonVisible(false);
+
+        if (!trainingMode)
+            feedbackUI?.Show(this);
+        // In training mode the offline controller calls SubmitDifficultyRating(...).
+    }
+
+    /// <summary>
+    /// Submit the player's difficulty rating for the round that just ended.
+    /// Triggers the deferred Q-learning update and re-opens the start button.
+    /// Called by DifficultyFeedbackUI (VR) or the offline controllers (synthetic).
+    /// </summary>
+    public void SubmitDifficultyRating(DifficultyRating rating)
+    {
+        if (!AwaitingFeedback) return;
+        AwaitingFeedback = false;
+
+        adaptiveController?.ApplyFeedback(rating);
+
+        if (!trainingMode)
+        {
+            feedbackUI?.Hide();
+            string summary = adaptiveController?.lastRoundSummary;
+            string explain = adaptiveController?.lastUpdateExplanation;
+            hud?.SetRoundState(RoundState.Results, stats, summary, explain);
+            ExportRoundReport();
+        }
+
+        targetManager?.DespawnAllTargets();
+        CurrentState = RoundState.Idle;
         SetStartButtonVisible(true);
-        StartCoroutine(DespawnThenIdle());
     }
 
     void ExportRoundReport()
@@ -195,18 +231,6 @@ public class ShooterRoundManager : MonoBehaviour
         ShooterRoundReport report = ShooterRoundReport.FromStats(stats, player, roundDuration);
         report.SaveToDisk();
         eventLog?.SaveToDisk(string.IsNullOrEmpty(player) ? "anonymous" : player);
-    }
-
-    IEnumerator DespawnThenIdle()
-    {
-        yield return new WaitForSeconds(despawnDelay);
-        targetManager?.DespawnAllTargets();
-
-        if (!trainingMode)
-            yield return new WaitForSeconds(0.5f);
-
-        CurrentState = RoundState.Idle;
-        SetStartButtonVisible(true);
     }
 
     void SetStartButtonVisible(bool visible)

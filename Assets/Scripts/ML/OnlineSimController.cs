@@ -6,8 +6,8 @@ using UnityEngine;
 
 /// <summary>
 /// Simulates a full online player session using SyntheticPlayer.
-/// Profile initialised via CreateFromBase (same as a real new player).
-/// Saves the profile after every round — identical to live gameplay.
+/// The profile starts fresh (CreateNew) — exactly like a real new player —
+/// and the synthetic player rates each round to drive the Q-update.
 /// </summary>
 public class OnlineSimController : MonoBehaviour
 {
@@ -15,6 +15,7 @@ public class OnlineSimController : MonoBehaviour
     public AdaptiveSpawnController adaptiveController;
     public ShooterRoundManager     roundManager;
     public ShooterEventLog         eventLog;
+    public SyntheticPlayer         syntheticPlayer;
 
     [Header("Simulation settings")]
     public float simulationTimeScale = 8f;
@@ -46,7 +47,7 @@ public class OnlineSimController : MonoBehaviour
     void Start()
     {
         string playerName = $"sim_{skillLevel.ToString().ToLower()}";
-        var profile = PlayerSkillProfile.CreateFromBase(playerName, skillLevel);
+        var profile = PlayerSkillProfile.CreateNew(playerName, skillLevel);
         adaptiveController.activeProfile = profile;
 
         Debug.Log($"[OnlineSim:{skillLevel}] Starting {roundsToSimulate}-round session " +
@@ -70,6 +71,11 @@ public class OnlineSimController : MonoBehaviour
 
             while (roundManager.CurrentState == RoundState.Active)
                 yield return null;
+
+            DifficultyRating rating = syntheticPlayer != null
+                ? syntheticPlayer.RateRound(roundManager.stats)
+                : DifficultyRating.Perfect;
+            roundManager.SubmitDifficultyRating(rating);
 
             while (roundManager.CurrentState != RoundState.Idle)
                 yield return null;
@@ -96,9 +102,8 @@ public class OnlineSimController : MonoBehaviour
         float avgTTH = AvgTimeToHit();
         float ppt = s.totalTargetsSpawned > 0 ? (float)s.totalPoints / s.totalTargetsSpawned : 0f;
 
-        float reward = PlayerSkillProfile.ComputeFlowReward(
-            hitRate, avgTTH, ppt,
-            s.stationary.HitRate, s.moving.HitRate, s.erratic.HitRate);
+        float reward = adaptiveController.lastReward;
+        int   rating = adaptiveController.lastRatingValue;
 
         _totalReward += reward;
         if (reward > _bestReward) { _bestReward = reward; _bestRound = _roundsCompleted; }
@@ -128,6 +133,7 @@ public class OnlineSimController : MonoBehaviour
             ptsPerHitMov       = s.moving.AvgPointsPerHit,
             ptsPerHitErr       = s.erratic.AvgPointsPerHit,
             reward             = reward,
+            rating             = rating,
             epsilon            = profile.epsilon,
             qState             = profile.GetCurrentState()
         });
@@ -178,7 +184,7 @@ public class OnlineSimController : MonoBehaviour
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("round,action,emphType,rotLevel,pace,hitRate,avgTTH,ppt,totalPts," +
                       "spawned,expired,hrStat,hrMov,hrErr,hrRot,pphStat,pphMov,pphErr," +
-                      "reward,epsilon,qState");
+                      "reward,epsilon,qState,rating");
         foreach (var r in _history)
         {
             sb.AppendLine($"{r.round},{r.action},{r.emphasisType},{r.rotationLevel},{r.spawnPace}," +
@@ -186,7 +192,7 @@ public class OnlineSimController : MonoBehaviour
                           $"{r.targetsSpawned},{r.expired}," +
                           $"{r.hitRateStat:F4},{r.hitRateMov:F4},{r.hitRateErr:F4},{r.hitRateRot:F4}," +
                           $"{r.ptsPerHitStat:F3},{r.ptsPerHitMov:F3},{r.ptsPerHitErr:F3}," +
-                          $"{r.reward:F4},{r.epsilon:F4},{r.qState}");
+                          $"{r.reward:F4},{r.epsilon:F4},{r.qState},{r.rating}");
         }
         File.WriteAllText(csvPath, sb.ToString());
 

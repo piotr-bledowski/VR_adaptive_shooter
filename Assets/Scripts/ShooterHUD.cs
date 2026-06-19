@@ -17,10 +17,12 @@ public class ShooterHUD : MonoBehaviour
     public Text   playerNameText;
     public Text   timerText;
     public Text   statsText;
+    public Text   agentText;
     public GameObject statsPanel;
     public GameObject gameplayHudRoot;
 
-    [Header("Stamina bar colours")]
+    [Header("Stamina bar")]
+    public bool  showStaminaBar = false;
     public Color staminaColorNormal = new Color(0.15f, 0.55f, 1f);
     public Color staminaColorLow    = new Color(0.9f,  0.15f, 0.1f);
     public float lowStaminaThreshold = 0.25f;
@@ -41,12 +43,24 @@ public class ShooterHUD : MonoBehaviour
 
         if (staminaFill != null)
         {
-            staminaFill.color = staminaColorNormal;
-            _staminaFillRt  = staminaFill.rectTransform;
-            _staminaFillRt.anchorMax = Vector2.one;
+            if (!showStaminaBar)
+            {
+                // Hide the whole bar (background + fill) and stop tracking it.
+                Transform barRoot = staminaFill.transform.parent != null
+                    ? staminaFill.transform.parent : staminaFill.transform;
+                barRoot.gameObject.SetActive(false);
+                staminaFill = null;
+            }
+            else
+            {
+                staminaFill.color = staminaColorNormal;
+                _staminaFillRt  = staminaFill.rectTransform;
+                _staminaFillRt.anchorMax = Vector2.one;
+            }
         }
         if (timerText  != null) timerText.gameObject.SetActive(false);
         if (statsPanel != null) statsPanel.SetActive(false);
+        EnsureSplitResultsLayout();
         SetSessionPhase(SessionPhase.PlayerSelect, "");
     }
 
@@ -75,7 +89,7 @@ public class ShooterHUD : MonoBehaviour
             if (_player == null) return;
         }
 
-        if (staminaFill != null && _staminaFillRt != null)
+        if (showStaminaBar && staminaFill != null && _staminaFillRt != null)
         {
             float ratio = Mathf.Clamp01(_player.currentStamina / _player.maxStamina);
             _staminaFillRt.anchorMax = new Vector2(ratio, 1f);
@@ -125,34 +139,104 @@ public class ShooterHUD : MonoBehaviour
             if (scoreText != null) scoreText.text = "0";
         }
 
-        if (state == RoundState.Results && stats != null && statsText != null)
-            statsText.text = FormatStats(stats, agentSummary, agentExplanation);
+        if (state == RoundState.Results && stats != null)
+            UpdateResultsPanel(stats, agentSummary, agentExplanation);
+    }
+
+    void UpdateResultsPanel(ShooterStats stats, string agentSummary, string agentExplanation)
+    {
+        if (statsText != null)
+            statsText.text = FormatRoundStats(stats);
+
+        string agentPanel = FormatAgentPanel(agentSummary, agentExplanation);
+        if (agentText != null)
+            agentText.text = agentPanel;
+        else if (statsText != null)
+            statsText.text += "\n\n" + agentPanel;
+    }
+
+    /// <summary>
+    /// Older scenes had one tall stats column; upgrade to a left/right split at runtime.
+    /// </summary>
+    void EnsureSplitResultsLayout()
+    {
+        if (statsPanel == null || statsText == null || agentText != null) return;
+
+        RectTransform panelRt = statsPanel.GetComponent<RectTransform>();
+        if (panelRt != null)
+        {
+            panelRt.sizeDelta        = new Vector2(720f, 420f);
+            panelRt.anchoredPosition = new Vector2(-55f, -10f);
+        }
+
+        RectTransform leftRt = statsText.rectTransform;
+        leftRt.anchorMin = new Vector2(0f, 0f);
+        leftRt.anchorMax = new Vector2(0.48f, 1f);
+        leftRt.offsetMin = new Vector2(12f, 12f);
+        leftRt.offsetMax = new Vector2(-6f, -12f);
+        statsText.alignment = TextAnchor.UpperLeft;
+        statsText.fontSize  = 18;
+        statsText.horizontalOverflow = HorizontalWrapMode.Wrap;
+        statsText.verticalOverflow   = VerticalWrapMode.Overflow;
+
+        GameObject agentObj = new GameObject("AgentText");
+        agentObj.transform.SetParent(statsPanel.transform, false);
+        agentText = agentObj.AddComponent<Text>();
+        agentText.font      = statsText.font;
+        agentText.fontSize  = 18;
+        agentText.alignment = TextAnchor.UpperLeft;
+        agentText.color     = new Color(0.82f, 0.94f, 1f);
+        agentText.horizontalOverflow = HorizontalWrapMode.Wrap;
+        agentText.verticalOverflow   = VerticalWrapMode.Overflow;
+
+        RectTransform rightRt = agentObj.GetComponent<RectTransform>();
+        rightRt.anchorMin = new Vector2(0.52f, 0f);
+        rightRt.anchorMax = new Vector2(1f, 1f);
+        rightRt.offsetMin = new Vector2(6f, 12f);
+        rightRt.offsetMax = new Vector2(-12f, -12f);
     }
 
     public void OnScoreChanged(int newTotal, int bonus) => UpdateScore(newTotal, bonus);
 
-    static string FormatStats(ShooterStats s, string agentSummary, string agentExplanation)
+    static string FormatRoundStats(ShooterStats s)
     {
         string txt =
-            "══ ROUND RESULTS ══\n\n" +
-            $"Shots: {s.totalShots}  Hits: {s.totalHits} ({s.HitRate:P0})" +
-            $"  Expired: {s.totalExpired}\n" +
-            $"Points: {s.totalPoints}  Avg/target: {(s.totalTargetsSpawned > 0 ? (float)s.totalPoints / s.totalTargetsSpawned : 0f):F1}\n\n" +
+            "ROUND RESULTS\n\n" +
+            $"Shots: {s.totalShots}  Hits: {s.totalHits} ({s.HitRate:P0})\n" +
+            $"Expired: {s.totalExpired}\n" +
+            $"Points: {s.totalPoints}  Avg/target: " +
+            $"{(s.totalTargetsSpawned > 0 ? (float)s.totalPoints / s.totalTargetsSpawned : 0f):F1}\n\n" +
             FormatType("STATIONARY", s.stationary) +
             FormatType("MOVING", s.moving) +
             FormatType("ERRATIC", s.erratic);
 
         if (s.rotating.hits > 0 || s.rotating.expired > 0)
-            txt += FormatType("ROTATING (all types)", s.rotating);
+            txt += FormatType("ROTATING", s.rotating);
 
-        if (!string.IsNullOrEmpty(agentSummary))
-            txt += "\n── AGENT ──\n" + agentSummary + "\n";
-
-        if (!string.IsNullOrEmpty(agentExplanation))
-            txt += "\n── NEXT ROUND ──\n" + agentExplanation + "\n";
-
-        txt += "\n<Press START for next round>";
         return txt;
+    }
+
+    static string FormatAgentPanel(string agentSummary, string agentExplanation)
+    {
+        if (string.IsNullOrEmpty(agentSummary))
+        {
+            return "HOW DID THAT FEEL?\n\n" +
+                   "Shoot a rating button\n" +
+                   "along the firing line:\n\n" +
+                   "Too Easy · Easy · Perfect\n" +
+                   "Hard · Too Hard";
+        }
+
+        string txt = "AGENT UPDATE\n\n" + agentSummary;
+        if (!string.IsNullOrEmpty(agentExplanation))
+            txt += "\n\n" + agentExplanation;
+        txt += "\n\nPress START for next round";
+        return txt;
+    }
+
+    static string FormatStats(ShooterStats s, string agentSummary, string agentExplanation)
+    {
+        return FormatRoundStats(s) + "\n\n" + FormatAgentPanel(agentSummary, agentExplanation);
     }
 
     static string FormatType(string label, TargetTypeStats ts)

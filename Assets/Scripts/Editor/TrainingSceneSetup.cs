@@ -32,11 +32,11 @@ public static class TrainingSceneSetup
 
         const float spacing = 60f;
         CreateEnvironment("Env_Beginner",     new Vector3(-spacing, 0f, 0f),
-                          SyntheticPlayer.SkillProfile.Naive,   PlayerSkillLevel.Beginner,   500);
+                          SyntheticPlayer.SkillProfile.Naive,   PlayerSkillLevel.Beginner,   50);
         CreateEnvironment("Env_Intermediate", new Vector3(0f,       0f, 0f),
-                          SyntheticPlayer.SkillProfile.Average, PlayerSkillLevel.Intermediate, 500);
+                          SyntheticPlayer.SkillProfile.Average, PlayerSkillLevel.Intermediate, 50);
         CreateEnvironment("Env_Advanced",     new Vector3(spacing,  0f, 0f),
-                          SyntheticPlayer.SkillProfile.Expert,  PlayerSkillLevel.Advanced,   500);
+                          SyntheticPlayer.SkillProfile.Expert,  PlayerSkillLevel.Advanced,   50);
 
         GameObject camObj = new GameObject("MainCamera");
         camObj.AddComponent<Camera>();

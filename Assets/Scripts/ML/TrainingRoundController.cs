@@ -20,7 +20,7 @@ public class TrainingRoundController : MonoBehaviour
 
     [Header("Training settings")]
     public float trainingTimeScale = 6f;
-    public int   roundsToTrain     = 200;
+    public int   roundsToTrain     = 50;
     public float interRoundDelay   = 0.05f;
     public PlayerSkillLevel skillLevel = PlayerSkillLevel.Intermediate;
 
@@ -69,6 +69,15 @@ public class TrainingRoundController : MonoBehaviour
             while (roundManager.CurrentState == RoundState.Active)
                 yield return null;
 
+            // Round ended — the synthetic player rates it, which drives the Q-update.
+            DifficultyRating rating = syntheticPlayer != null
+                ? syntheticPlayer.RateRound(roundManager.stats)
+                : DifficultyRating.Perfect;
+            roundManager.SubmitDifficultyRating(rating);
+
+            while (roundManager.CurrentState != RoundState.Idle)
+                yield return null;
+
             OnRoundComplete();
 
             if (_roundsCompleted >= roundsToTrain)
@@ -90,9 +99,10 @@ public class TrainingRoundController : MonoBehaviour
         float hitRate = s.HitRate;
         float avgTTH = ComputeAvgTimeToHit();
         float ppt = s.totalTargetsSpawned > 0 ? (float)s.totalPoints / s.totalTargetsSpawned : 0f;
-        float reward = PlayerSkillProfile.ComputeFlowReward(
-            hitRate, avgTTH, ppt,
-            s.stationary.HitRate, s.moving.HitRate, s.erratic.HitRate);
+
+        // Reward + rating come from the deferred feedback update applied this round.
+        float reward = adaptiveController.lastReward;
+        int   rating = adaptiveController.lastRatingValue;
 
         _totalReward += reward;
         if (reward > _bestReward) { _bestReward = reward; _bestRound = _roundsCompleted; }
@@ -122,6 +132,7 @@ public class TrainingRoundController : MonoBehaviour
             ptsPerHitMov       = s.moving.AvgPointsPerHit,
             ptsPerHitErr       = s.erratic.AvgPointsPerHit,
             reward             = reward,
+            rating             = rating,
             epsilon            = profile.epsilon,
             qState             = profile.GetCurrentState()
         });
@@ -182,7 +193,7 @@ public class TrainingRoundController : MonoBehaviour
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("round,action,emphType,rotLevel,pace,hitRate,avgTTH,ppt,totalPts," +
                       "spawned,expired,hrStat,hrMov,hrErr,hrRot,pphStat,pphMov,pphErr," +
-                      "reward,epsilon,qState");
+                      "reward,epsilon,qState,rating");
         foreach (var r in _history)
         {
             sb.AppendLine($"{r.round},{r.action},{r.emphasisType},{r.rotationLevel},{r.spawnPace}," +
@@ -190,7 +201,7 @@ public class TrainingRoundController : MonoBehaviour
                           $"{r.targetsSpawned},{r.expired}," +
                           $"{r.hitRateStat:F4},{r.hitRateMov:F4},{r.hitRateErr:F4},{r.hitRateRot:F4}," +
                           $"{r.ptsPerHitStat:F3},{r.ptsPerHitMov:F3},{r.ptsPerHitErr:F3}," +
-                          $"{r.reward:F4},{r.epsilon:F4},{r.qState}");
+                          $"{r.reward:F4},{r.epsilon:F4},{r.qState},{r.rating}");
         }
         File.WriteAllText(csvPath, sb.ToString());
 
@@ -246,6 +257,7 @@ public struct TrainingRoundRecord
     public float  ptsPerHitMov;
     public float  ptsPerHitErr;
     public float  reward;
+    public int    rating;
     public float  epsilon;
     public int    qState;
 }

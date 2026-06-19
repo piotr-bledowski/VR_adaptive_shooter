@@ -83,9 +83,8 @@ public class PlayerSessionManager : MonoBehaviour
     void OnSkillSelected(PlayerSkillLevel level)
     {
         PlayerRegistry.AddPlayerIfNew(CurrentPlayerName);
-        // Always start fresh — the chosen skill level seeds the initial EMA estimates
-        // and Q-table bias so the agent begins in a sensible region of action space,
-        // but the Q-table itself is uninformed (learns purely from this player's play).
+        // Always start fresh — skill level is stored for metadata only; the Q-table
+        // is identical for every new profile (one shared random draw per play session).
         var profile = PlayerSkillProfile.CreateNew(CurrentPlayerName, level);
         profile.Save();
         LoadProfileAndEnterGameplay(profile);

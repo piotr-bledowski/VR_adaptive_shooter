@@ -4,40 +4,72 @@ using UnityEngine;
 
 public enum PlayerSkillLevel { Beginner = 0, Intermediate = 1, Advanced = 2 }
 
+/// <summary>
+/// Player's subjective difficulty rating, gathered after every round.
+/// In VR gameplay a human picks this on a 5-button panel; in offline training a
+/// SyntheticPlayer derives it from its own preferences. This rating is the MAIN
+/// driver of the Q-learning reward.
+/// </summary>
+public enum DifficultyRating { TooEasy = 0, Easy = 1, Perfect = 2, Hard = 3, TooHard = 4 }
+
+/// <summary>
+/// Tabular Q-learning profile that adapts spawn difficulty to a single player.
+///
+/// The agent picks one action per round (target emphasis × rotation × spawn pace),
+/// the player plays, then rates the round. The rating maps to a scalar reward and a
+/// one-step Q-update is applied. Optimistic initialisation + a fast ε-decay let the
+/// table converge to a near-greedy policy within ~10 rounds.
+///
+/// This class is intentionally generic: nothing here knows about the offline
+/// synthetic personas. The chosen skill level is stored for metadata only;
+/// every new profile starts from the same neutral Q-table.
+/// </summary>
 [Serializable]
 public class PlayerSkillProfile
 {
     public string playerName;
     public int    skillLevel;
     public int    roundsPlayed;
-    public float  lifetimeHitRate;
-    public float  lifetimeAvgTimeToHit;
 
-    // Q-table: [stateIndex * ACTION_COUNT + actionIndex] → expected reward
+    // Q-table: [stateIndex * ACTION_COUNT + actionIndex] → expected (discounted) reward.
     public float[] qTable;
 
     public float epsilon;
 
-    // Global EMAs
+    // Last difficulty rating the player gave (−1 = none yet). Part of the state.
+    public int lastRating = -1;
+
+    // Runtime-only: set during UpdateAfterRound so ApplyFeedback can surface it.
+    [NonSerialized] public string lastGuidanceNote = "";
+
+    // Lightweight EMAs kept for state bucketing, reporting and explainability.
     public float emaHitRate;
     public float emaTimeToHit;
-    public float emaEngagement;
 
-    // Per-type EMAs
-    public float emaHitRateStationary, emaHitRateMoving, emaHitRateErratic;
-    public float emaTTHStationary, emaTTHMoving, emaTTHErratic;
-    public float emaPointsStationary, emaPointsMoving, emaPointsErratic;
-    public float emaHitRateRotating;
-    public float emaPointsPerTarget;
+    public float lifetimeHitRate;
+    public float lifetimeAvgTimeToHit;
 
-    const int STATE_COUNT  = 27;
-    const int ACTION_COUNT = 36;
-    const float INITIAL_EPSILON = 0.70f;
-    const float MIN_EPSILON     = 0.06f;
-    const float EPSILON_DECAY   = 0.975f;
-    const float LEARNING_RATE   = 0.3f;
-    const float DISCOUNT        = 0.7f;
-    const float EMA_ALPHA       = 0.4f;
+    // ── MDP dimensions ─────────────────────────────────────────────────────────
+    //  State  = lastRating (5) × hitRateBucket (3)            = 15
+    //  Action = emphasis (3) × rotation (4) × spawnPace (3)   = 36
+    public const int STATE_COUNT  = 15;
+    public const int ACTION_COUNT = 36;
+
+    // ── Hyper-parameters (tuned for fast, ~10-round convergence) ────────────────
+    const float OPTIMISTIC_INIT = 2.0f;   // = max achievable immediate reward (Perfect)
+    const float INITIAL_EPSILON = 0.30f;
+    const float MIN_EPSILON     = 0.0f;
+    const float EPSILON_DECAY   = 0.75f;  // ε ≈ 0.02 by round 8-9 → effectively greedy
+    const float LEARNING_RATE   = 0.5f;
+    const float DISCOUNT        = 0.5f;
+    const float EMA_ALPHA       = 0.5f;   // responsive stats for short sessions
+    const float INIT_NOISE      = 0.08f;  // per-cell jitter in the shared start table
+
+    // One random Q-table drawn per play session; every new profile clones it.
+    static float[] _sharedQTemplate;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetSharedQTemplate() => _sharedQTemplate = null;
 
     public PlayerSkillProfile() { }
 
@@ -45,13 +77,20 @@ public class PlayerSkillProfile
 
     public static void DecodeAction(int action, out int emphasisType, out int rotationLevel, out int spawnPace)
     {
-        emphasisType = action / 12;
-        rotationLevel = (action % 12) / 3;
-        spawnPace = action % 3;
+        emphasisType  = action / 12;        // 0 Stationary, 1 Moving, 2 Erratic
+        rotationLevel = (action % 12) / 3;  // 0 None, 1 Slow, 2 Medium, 3 Fast
+        spawnPace     = action % 3;         // 0 Fast, 1 Medium, 2 Slow
     }
+
+    public static int EncodeAction(int emphasisType, int rotationLevel, int spawnPace)
+        => emphasisType * 12 + rotationLevel * 3 + spawnPace;
 
     // ── Factory ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Fresh profile. Every agent clones the same randomly drawn Q-table (built once
+    /// per session on the first call). Skill level is stored but does not bias init.
+    /// </summary>
     public static PlayerSkillProfile CreateNew(string name, PlayerSkillLevel skill)
     {
         var p = new PlayerSkillProfile
@@ -59,157 +98,44 @@ public class PlayerSkillProfile
             playerName           = name,
             skillLevel           = (int)skill,
             roundsPlayed         = 0,
+            epsilon              = INITIAL_EPSILON,
+            lastRating           = -1,
+            emaHitRate           = 0.5f,
+            emaTimeToHit         = 1.0f,
             lifetimeHitRate      = 0f,
             lifetimeAvgTimeToHit = 0f,
-            epsilon              = INITIAL_EPSILON,
-            emaHitRate           = GetDefaultHitRate(skill),
-            emaTimeToHit         = GetDefaultTimeToHit(skill),
-            emaEngagement        = 1.5f,
             qTable               = new float[STATE_COUNT * ACTION_COUNT]
         };
 
-        SetDefaultPerTypeEMAs(p, skill);
-        InitializeQTableFromProfile(p, skill);
+        InitializeQTable(p);
         return p;
     }
 
-    static void SetDefaultPerTypeEMAs(PlayerSkillProfile p, PlayerSkillLevel skill)
+    static void InitializeQTable(PlayerSkillProfile p)
     {
-        switch (skill)
+        if (_sharedQTemplate == null)
         {
-            case PlayerSkillLevel.Beginner:
-                // Seeded near the expected values for Naive player with easy targets.
-                // Stationary strong, erratic very weak — agent should learn Stationary+None.
-                p.emaHitRateStationary = 0.75f;
-                p.emaHitRateMoving     = 0.42f;
-                p.emaHitRateErratic    = 0.22f;
-                p.emaTTHStationary     = 1.2f;
-                p.emaTTHMoving         = 2.0f;
-                p.emaTTHErratic        = 3.5f;
-                p.emaPointsStationary  = 1.2f;
-                p.emaPointsMoving      = 0.8f;
-                p.emaPointsErratic     = 0.4f;
-                p.emaHitRateRotating   = 0.25f;
-                p.emaPointsPerTarget   = 0.9f;
-                break;
-            case PlayerSkillLevel.Intermediate:
-                // Seeded near expected values for Average player.
-                // Strong on stationary, moderate on moving — agent should avoid rotation.
-                p.emaHitRateStationary = 0.88f;
-                p.emaHitRateMoving     = 0.55f;
-                p.emaHitRateErratic    = 0.28f;
-                p.emaTTHStationary     = 0.7f;
-                p.emaTTHMoving         = 1.0f;
-                p.emaTTHErratic        = 1.8f;
-                p.emaPointsStationary  = 3.5f;
-                p.emaPointsMoving      = 2.0f;
-                p.emaPointsErratic     = 1.0f;
-                p.emaHitRateRotating   = 0.35f;
-                p.emaPointsPerTarget   = 2.2f;
-                break;
-            case PlayerSkillLevel.Advanced:
-                // Seeded near expected values for Expert player without rotation.
-                // All hit rates appear high — agent must discover fast rotation is the lever.
-                p.emaHitRateStationary = 0.97f;
-                p.emaHitRateMoving     = 0.90f;
-                p.emaHitRateErratic    = 0.76f;
-                p.emaTTHStationary     = 0.15f;
-                p.emaTTHMoving         = 0.25f;
-                p.emaTTHErratic        = 0.40f;
-                p.emaPointsStationary  = 7.5f;
-                p.emaPointsMoving      = 6.5f;
-                p.emaPointsErratic     = 5.5f;
-                p.emaHitRateRotating   = 0.66f;
-                p.emaPointsPerTarget   = 6.5f;
-                break;
-            default:
-                goto case PlayerSkillLevel.Intermediate;
+            _sharedQTemplate = new float[STATE_COUNT * ACTION_COUNT];
+            for (int i = 0; i < _sharedQTemplate.Length; i++)
+                _sharedQTemplate[i] = OPTIMISTIC_INIT + UnityEngine.Random.Range(-INIT_NOISE, INIT_NOISE);
         }
-    }
-
-    static void InitializeQTableFromProfile(PlayerSkillProfile p, PlayerSkillLevel skill)
-    {
-        // Beginner:     Stationary(0) + None(0) + Medium pace(1)  → 0*12+0*3+1 = 1
-        // Intermediate: Stationary(0) + None(0) + Medium pace(1)  → 1  (same start, learns to Moving)
-        // Advanced:     Erratic(2)   + Fast(3)  + Fast pace(0)   → 2*12+3*3+0 = 33
-        int preferredAction;
-        switch (skill)
-        {
-            case PlayerSkillLevel.Beginner:     preferredAction = 1;  break;
-            case PlayerSkillLevel.Intermediate: preferredAction = 1;  break;
-            case PlayerSkillLevel.Advanced:     preferredAction = 33; break;
-            default:                            preferredAction = 1;  break;
-        }
-
-        DecodeAction(preferredAction, out int pType, out int pRot, out int pPace);
-
-        for (int s = 0; s < STATE_COUNT; s++)
-        {
-            for (int a = 0; a < ACTION_COUNT; a++)
-            {
-                DecodeAction(a, out int aType, out int aRot, out int aPace);
-                float dist = Mathf.Abs(aType - pType) + Mathf.Abs(aRot - pRot) * 0.5f + Mathf.Abs(aPace - pPace) * 0.7f;
-                p.qTable[s * ACTION_COUNT + a] = Mathf.Max(0f, 0.5f - dist * 0.08f);
-            }
-        }
-    }
-
-    static float GetDefaultHitRate(PlayerSkillLevel skill)
-    {
-        switch (skill)
-        {
-            case PlayerSkillLevel.Beginner:     return 0.46f;  // Naive + Stat+None effective rate
-            case PlayerSkillLevel.Intermediate: return 0.57f;  // Average + Stat+None effective rate
-            case PlayerSkillLevel.Advanced:     return 0.88f;  // Expert before rotation is applied
-            default:                            return 0.5f;
-        }
-    }
-
-    static float GetDefaultTimeToHit(PlayerSkillLevel skill)
-    {
-        switch (skill)
-        {
-            case PlayerSkillLevel.Beginner:     return 1.2f;   // slow fire rate, often 2nd shot
-            case PlayerSkillLevel.Intermediate: return 0.7f;   // medium fire rate
-            case PlayerSkillLevel.Advanced:     return 0.15f;  // expert reacts very fast
-            default:                            return 1.0f;
-        }
+        System.Array.Copy(_sharedQTemplate, p.qTable, _sharedQTemplate.Length);
     }
 
     // ── State discretization ─────────────────────────────────────────────────
 
+    /// <summary>
+    /// State = lastRating (5, defaults to Perfect before the first rating) ×
+    ///         hit-rate bucket (0 low &lt;0.35, 1 mid, 2 high &gt;0.60).
+    /// </summary>
     public int GetCurrentState()
     {
-        float composite = emaHitRate * 0.6f + Mathf.Clamp01(emaPointsPerTarget / 10f) * 0.4f;
-        int perfBucket = composite < 0.30f ? 0 : (composite < 0.60f ? 1 : 2);
-        int paceBucket = emaTimeToHit > 3.5f ? 0 : (emaTimeToHit > 1.5f ? 1 : 2);
-        int weakest = ComputeWeakestType();
-        return perfBucket * 9 + paceBucket * 3 + weakest;
+        int ratingBucket = lastRating < 0 ? (int)DifficultyRating.Perfect : Mathf.Clamp(lastRating, 0, 4);
+        int perfBucket   = emaHitRate < 0.35f ? 0 : (emaHitRate < 0.60f ? 1 : 2);
+        return ratingBucket * 3 + perfBucket;
     }
 
-    int ComputeWeakestType()
-    {
-        float statHR = emaHitRateStationary;
-        float movHR = emaHitRateMoving;
-        float errHR = emaHitRateErratic;
-
-        float min = Mathf.Min(statHR, movHR, errHR);
-        float max = Mathf.Max(statHR, movHR, errHR);
-
-        if (max - min < 0.15f)
-        {
-            float minPts = Mathf.Min(emaPointsStationary, emaPointsMoving, emaPointsErratic);
-            if (emaPointsStationary <= minPts) return 0;
-            if (emaPointsMoving <= minPts) return 1;
-            return 2;
-        }
-
-        if (statHR <= min) return 0;
-        if (movHR <= min) return 1;
-        return 2;
-    }
-
-    // ── Action selection (epsilon-greedy) ────────────────────────────────────
+    // ── Action selection (ε-greedy, random tie-break) ────────────────────────
 
     public int SelectAction()
     {
@@ -217,118 +143,198 @@ public class PlayerSkillProfile
             return UnityEngine.Random.Range(0, ACTION_COUNT);
 
         int state = GetCurrentState();
-        int bestAction = 0;
+        int baseIdx = state * ACTION_COUNT;
+
         float bestQ = float.NegativeInfinity;
         for (int a = 0; a < ACTION_COUNT; a++)
+            if (qTable[baseIdx + a] > bestQ) bestQ = qTable[baseIdx + a];
+
+        // Random tie-break so optimistic exploration sweeps actions in random order.
+        int count = 0;
+        int chosen = 0;
+        for (int a = 0; a < ACTION_COUNT; a++)
         {
-            float q = qTable[state * ACTION_COUNT + a];
-            if (q > bestQ) { bestQ = q; bestAction = a; }
+            if (qTable[baseIdx + a] >= bestQ - 1e-4f)
+            {
+                count++;
+                if (UnityEngine.Random.Range(0, count) == 0) chosen = a;
+            }
         }
-        return bestAction;
+        return chosen;
     }
 
-    // ── Learning update (after each round) ───────────────────────────────────
+    /// <summary>Greedy best action for the current state (ignores ε) — for display.</summary>
+    public int GreedyAction()
+    {
+        int baseIdx = GetCurrentState() * ACTION_COUNT;
+        int best = 0;
+        float bestQ = float.NegativeInfinity;
+        for (int a = 0; a < ACTION_COUNT; a++)
+            if (qTable[baseIdx + a] > bestQ) { bestQ = qTable[baseIdx + a]; best = a; }
+        return best;
+    }
 
-    public void UpdateAfterRound(
-        float hitRate, float avgTimeToHit, float shotsPerSec,
-        float hitRateStat, float hitRateMov, float hitRateErr,
-        float tthStat, float tthMov, float tthErr,
-        float ptsStat, float ptsMov, float ptsErr,
-        float hitRateRotating, float pointsPerTarget,
-        int actionTaken, float reward)
+    // ── Difficulty ordering ───────────────────────────────────────────────────
+
+    // Built-in difficulty weights per action dimension.
+    // emphasisType:  Stationary(0) < Moving(1) < Erratic(2)        weight 1.0
+    // rotationLevel: None(0) < Slow(1) < Medium(2) < Fast(3)       weight 0.75
+    // spawnPace:     Slow(2) < Medium(1) < Fast(0)  (inverted)     weight 0.50
+    // Max raw score = 2 + 3*0.75 + 2*0.50 = 5.25
+    const float MAX_DIFFICULTY   = 5.25f;
+    const float GUIDANCE_STRONG  = 0.35f;   // nudge scale for TooEasy / TooHard
+    const float GUIDANCE_MILD    = 0.12f;   // nudge scale for Easy / Hard
+
+    /// <summary>
+    /// Scalar difficulty of an action on a 0–5.25 scale based on
+    /// target type, rotation, and spawn pace semantics.
+    /// </summary>
+    public static float ActionDifficulty(int action)
+    {
+        DecodeAction(action, out int emph, out int rot, out int pace);
+        return emph * 1.0f + rot * 0.75f + (2 - pace) * 0.50f;
+    }
+
+    // ── Reward ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The player's difficulty rating IS the reward signal.
+    /// Perfect is the goal; the adjacent ratings give a directional gradient.
+    /// </summary>
+    public static float ComputeRatingReward(DifficultyRating rating)
+    {
+        switch (rating)
+        {
+            case DifficultyRating.Perfect: return  2.0f;
+            case DifficultyRating.Easy:    return  0.5f;
+            case DifficultyRating.Hard:    return  0.5f;
+            case DifficultyRating.TooEasy: return -1.0f;
+            case DifficultyRating.TooHard: return -1.0f;
+            default:                       return  0f;
+        }
+    }
+
+    // ── Learning update (after each round, once the rating is known) ──────────
+
+    /// <summary>
+    /// One-step Q-update. <paramref name="stateAtSelection"/> is the state in which
+    /// the action was chosen (captured at round start). The reward comes from the
+    /// player's rating; stats are folded into the EMAs to form the next state.
+    /// </summary>
+    public void UpdateAfterRound(int stateAtSelection, int actionTaken,
+                                 DifficultyRating rating, float reward,
+                                 float hitRate, float avgTimeToHit)
     {
         roundsPlayed++;
 
-        // Global EMAs
-        emaHitRate    = Mathf.Lerp(emaHitRate,    hitRate,      EMA_ALPHA);
-        emaTimeToHit  = Mathf.Lerp(emaTimeToHit,  avgTimeToHit, EMA_ALPHA);
-        emaEngagement = Mathf.Lerp(emaEngagement, shotsPerSec,  EMA_ALPHA);
-
-        // Per-type EMAs
-        emaHitRateStationary = Mathf.Lerp(emaHitRateStationary, hitRateStat, EMA_ALPHA);
-        emaHitRateMoving     = Mathf.Lerp(emaHitRateMoving,     hitRateMov,  EMA_ALPHA);
-        emaHitRateErratic    = Mathf.Lerp(emaHitRateErratic,    hitRateErr,  EMA_ALPHA);
-        emaTTHStationary     = Mathf.Lerp(emaTTHStationary,     tthStat,     EMA_ALPHA);
-        emaTTHMoving         = Mathf.Lerp(emaTTHMoving,         tthMov,      EMA_ALPHA);
-        emaTTHErratic        = Mathf.Lerp(emaTTHErratic,        tthErr,      EMA_ALPHA);
-        emaPointsStationary  = Mathf.Lerp(emaPointsStationary,  ptsStat,     EMA_ALPHA);
-        emaPointsMoving      = Mathf.Lerp(emaPointsMoving,      ptsMov,      EMA_ALPHA);
-        emaPointsErratic     = Mathf.Lerp(emaPointsErratic,     ptsErr,      EMA_ALPHA);
-        emaHitRateRotating   = Mathf.Lerp(emaHitRateRotating,   hitRateRotating, EMA_ALPHA);
-        emaPointsPerTarget   = Mathf.Lerp(emaPointsPerTarget,   pointsPerTarget, EMA_ALPHA);
-
-        // Lifetime stats
-        lifetimeHitRate      = Mathf.Lerp(lifetimeHitRate, hitRate, 1f / roundsPlayed);
+        emaHitRate   = Mathf.Lerp(emaHitRate,   hitRate,      EMA_ALPHA);
+        emaTimeToHit = Mathf.Lerp(emaTimeToHit, avgTimeToHit, EMA_ALPHA);
+        lifetimeHitRate      = Mathf.Lerp(lifetimeHitRate,      hitRate,      1f / roundsPlayed);
         lifetimeAvgTimeToHit = Mathf.Lerp(lifetimeAvgTimeToHit, avgTimeToHit, 1f / roundsPlayed);
 
-        // Q-learning Bellman update
-        int state = GetCurrentState();
-        int idx = state * ACTION_COUNT + actionTaken;
+        lastRating = (int)rating;   // becomes part of the next state
 
         int nextState = GetCurrentState();
+        int baseNext  = nextState * ACTION_COUNT;
         float maxNextQ = float.NegativeInfinity;
         for (int a = 0; a < ACTION_COUNT; a++)
-        {
-            float q = qTable[nextState * ACTION_COUNT + a];
-            if (q > maxNextQ) maxNextQ = q;
-        }
+            if (qTable[baseNext + a] > maxNextQ) maxNextQ = qTable[baseNext + a];
 
+        int idx = stateAtSelection * ACTION_COUNT + actionTaken;
         qTable[idx] += LEARNING_RATE * (reward + DISCOUNT * maxNextQ - qTable[idx]);
 
-        // Decay exploration
         epsilon = Mathf.Max(MIN_EPSILON, epsilon * EPSILON_DECAY);
-    }
 
-    // ── Reward computation ───────────────────────────────────────────────────
+        // ── Directional guidance ──────────────────────────────────────────────
+        // When the rating has a clear direction (too easy → need harder;
+        // too hard → need easier), nudge the Q-values of every other action in
+        // that direction proportionally to how much harder or easier each action is.
+        // This gives the model built-in knowledge of the difficulty ordering
+        // so it steers the right way without extra random exploration.
+        float guidanceScale;
+        float guidanceDir;
+        string guidanceDesc;
 
-    public static float ComputeFlowReward(float hitRate, float avgTimeToHit, float avgPointsPerTarget,
-        float hitRateStat, float hitRateMov, float hitRateErr)
-    {
-        float reward = 0f;
+        switch (rating)
+        {
+            case DifficultyRating.TooEasy:
+                guidanceScale = GUIDANCE_STRONG; guidanceDir = +1f;
+                guidanceDesc  = "Steering toward harder settings";
+                break;
+            case DifficultyRating.TooHard:
+                guidanceScale = GUIDANCE_STRONG; guidanceDir = -1f;
+                guidanceDesc  = "Steering toward easier settings";
+                break;
+            case DifficultyRating.Easy:
+                guidanceScale = GUIDANCE_MILD; guidanceDir = +1f;
+                guidanceDesc  = "Slight nudge toward harder settings";
+                break;
+            case DifficultyRating.Hard:
+                guidanceScale = GUIDANCE_MILD; guidanceDir = -1f;
+                guidanceDesc  = "Slight nudge toward easier settings";
+                break;
+            default:
+                guidanceScale = 0f; guidanceDir = 0f;
+                guidanceDesc  = "";
+                break;
+        }
 
-        float hitDist = Mathf.Abs(hitRate - 0.55f);
-        if (hitDist < 0.10f) reward += 2.0f;
-        else if (hitDist < 0.15f) reward += 1.0f;
-        else if (hitDist < 0.25f) reward += 0.3f;
-        else reward -= 1.0f;
-
-        float timeDist = Mathf.Abs(avgTimeToHit - 2.5f);
-        if (timeDist < 0.5f) reward += 1.0f;
-        else if (timeDist < 1.5f) reward += 0.3f;
-        else reward -= 0.5f;
-
-        float ptsDist = Mathf.Abs(avgPointsPerTarget - 4f);
-        if (ptsDist < 1f) reward += 0.5f;
-        else if (ptsDist < 2f) reward += 0.2f;
-        else reward -= 0.3f;
-
-        float typeRange = Mathf.Max(hitRateStat, hitRateMov, hitRateErr) -
-                          Mathf.Min(hitRateStat, hitRateMov, hitRateErr);
-        if (typeRange < 0.15f) reward += 0.3f;
-        else if (typeRange > 0.35f) reward -= 0.3f;
-
-        return reward;
+        if (guidanceScale > 0f)
+        {
+            float currentDiff = ActionDifficulty(actionTaken);
+            int   baseS       = stateAtSelection * ACTION_COUNT;
+            for (int a = 0; a < ACTION_COUNT; a++)
+            {
+                if (a == actionTaken) continue;
+                float diff  = ActionDifficulty(a);
+                float nudge = guidanceScale * guidanceDir * (diff - currentDiff) / MAX_DIFFICULTY;
+                qTable[baseS + a] += nudge;
+            }
+            lastGuidanceNote = guidanceDesc;
+        }
+        else
+        {
+            lastGuidanceNote = "";
+        }
     }
 
     // ── Explainability ───────────────────────────────────────────────────────
 
+    static readonly string[] TYPE_NAMES = { "Stationary", "Moving", "Erratic" };
+    static readonly string[] ROT_NAMES  = { "no rotation", "slow rotation", "medium rotation", "fast rotation" };
+    static readonly string[] PACE_NAMES = { "fast spawns (1-2s)", "medium spawns (3-4s)", "slow spawns (5-6s)" };
+
+    public static string DescribeAction(int action)
+    {
+        DecodeAction(action, out int t, out int r, out int p);
+        return $"{TYPE_NAMES[t]} emphasis, {ROT_NAMES[r]}, {PACE_NAMES[p]}";
+    }
+
     public static string ExplainActionChange(int prevAction, int newAction)
     {
-        DecodeAction(prevAction, out int pType, out int pRot, out int pPace);
-        DecodeAction(newAction, out int nType, out int nRot, out int nPace);
+        if (prevAction == newAction) return "Strategy unchanged — keeping current settings.";
+
+        DecodeAction(prevAction, out int pT, out int pR, out int pP);
+        DecodeAction(newAction,  out int nT, out int nR, out int nP);
 
         var parts = new System.Collections.Generic.List<string>();
+        if (nT != pT) parts.Add($"target focus {TYPE_NAMES[pT]} \u2192 {TYPE_NAMES[nT]}");
+        if (nR != pR) parts.Add($"{ROT_NAMES[pR]} \u2192 {ROT_NAMES[nR]}");
+        if (nP != pP) parts.Add($"{PACE_NAMES[pP]} \u2192 {PACE_NAMES[nP]}");
+        return "Adjusting: " + string.Join(", ", parts);
+    }
 
-        string[] typeNames = {"Stationary", "Moving", "Erratic"};
-        string[] rotNames = {"No rotation", "Slow rotation", "Medium rotation", "Fast rotation"};
-        string[] paceNames = {"Fast spawns (1-2s)", "Medium spawns (3-4s)", "Slow spawns (5-6s)"};
-
-        if (nType != pType) parts.Add($"Target emphasis: {typeNames[pType]} \u2192 {typeNames[nType]}");
-        if (nRot != pRot) parts.Add($"Rotation: {rotNames[pRot]} \u2192 {rotNames[nRot]}");
-        if (nPace != pPace) parts.Add($"Spawn pace: {paceNames[pPace]} \u2192 {paceNames[nPace]}");
-
-        if (parts.Count == 0) return "No change in strategy";
-        return string.Join("\n", parts);
+    public static string RatingLabel(DifficultyRating rating)
+    {
+        switch (rating)
+        {
+            case DifficultyRating.TooEasy: return "Too Easy";
+            case DifficultyRating.Easy:    return "Easy";
+            case DifficultyRating.Perfect: return "Perfect";
+            case DifficultyRating.Hard:    return "Hard";
+            case DifficultyRating.TooHard: return "Too Hard";
+            default:                       return "?";
+        }
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
@@ -338,7 +344,6 @@ public class PlayerSkillProfile
         switch (skill)
         {
             case PlayerSkillLevel.Beginner:     return "_base_beginner";
-            case PlayerSkillLevel.Intermediate: return "_base_intermediate";
             case PlayerSkillLevel.Advanced:     return "_base_advanced";
             default:                            return "_base_intermediate";
         }
@@ -371,51 +376,21 @@ public class PlayerSkillProfile
         Debug.Log($"[Profile] Saved base profile for {skill} \u2192 {GetProfilePath(BaseProfileName(skill))}");
     }
 
-    public static PlayerSkillProfile CreateFromBase(string playerName, PlayerSkillLevel skill)
-    {
-        var baseProfile = LoadRaw(BaseProfileName(skill));
-        if (baseProfile != null)
-        {
-            var p = new PlayerSkillProfile
-            {
-                playerName           = playerName,
-                skillLevel           = (int)skill,
-                roundsPlayed         = 0,
-                lifetimeHitRate      = baseProfile.emaHitRate,
-                lifetimeAvgTimeToHit = baseProfile.emaTimeToHit,
-                epsilon              = INITIAL_EPSILON,
-                emaHitRate           = baseProfile.emaHitRate,
-                emaTimeToHit         = baseProfile.emaTimeToHit,
-                emaEngagement        = baseProfile.emaEngagement,
-                emaHitRateStationary = baseProfile.emaHitRateStationary,
-                emaHitRateMoving     = baseProfile.emaHitRateMoving,
-                emaHitRateErratic    = baseProfile.emaHitRateErratic,
-                emaTTHStationary     = baseProfile.emaTTHStationary,
-                emaTTHMoving         = baseProfile.emaTTHMoving,
-                emaTTHErratic        = baseProfile.emaTTHErratic,
-                emaPointsStationary  = baseProfile.emaPointsStationary,
-                emaPointsMoving      = baseProfile.emaPointsMoving,
-                emaPointsErratic     = baseProfile.emaPointsErratic,
-                emaHitRateRotating   = baseProfile.emaHitRateRotating,
-                emaPointsPerTarget   = baseProfile.emaPointsPerTarget,
-                qTable               = (float[])baseProfile.qTable.Clone()
-            };
-            Debug.Log($"[Profile] '{playerName}' initialized from trained base ({skill}).");
-            return p;
-        }
-
-        Debug.Log($"[Profile] No base for {skill}, using hand-seeded defaults for '{playerName}'.");
-        return CreateNew(playerName, skill);
-    }
-
-    public static PlayerSkillProfile Load(string playerName)   => LoadRaw(playerName);
+    public static PlayerSkillProfile Load(string playerName) => LoadRaw(playerName);
     public static bool Exists(string playerName) => File.Exists(GetProfilePath(playerName));
 
     static PlayerSkillProfile LoadRaw(string profileName)
     {
         string path = GetProfilePath(profileName);
         if (!File.Exists(path)) return null;
-        try   { return JsonUtility.FromJson<PlayerSkillProfile>(File.ReadAllText(path)); }
+        try
+        {
+            var p = JsonUtility.FromJson<PlayerSkillProfile>(File.ReadAllText(path));
+            // Guard against schema drift from older saves.
+            if (p != null && (p.qTable == null || p.qTable.Length != STATE_COUNT * ACTION_COUNT))
+                return null;
+            return p;
+        }
         catch { return null; }
     }
 }

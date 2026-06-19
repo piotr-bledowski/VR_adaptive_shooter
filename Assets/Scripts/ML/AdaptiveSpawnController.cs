@@ -1,5 +1,15 @@
 using UnityEngine;
 
+/// <summary>
+/// Bridges the Q-learning <see cref="PlayerSkillProfile"/> to the spawn system.
+///
+///  • OnRoundStart()        — pick one action; its parameters are fixed for the round.
+///  • ConfigureNextSpawn()  — apply those parameters before every spawn.
+///  • CaptureRoundMetrics() — snapshot the round's measured stats (no learning yet).
+///  • ApplyFeedback(rating) — turn the player's difficulty rating into a reward and
+///                            run the Q-update. Called once the rating is known
+///                            (from the human in VR, or the synthetic player offline).
+/// </summary>
 public class AdaptiveSpawnController : MonoBehaviour
 {
     [Header("References")]
@@ -16,8 +26,11 @@ public class AdaptiveSpawnController : MonoBehaviour
     public int    previousAction = -1;
     public string lastUpdateExplanation;
     public string lastRoundSummary;
+    public float  lastReward;
+    public int    lastRatingValue = -1;
+    public string lastRatingLabel = "";
 
-    int _lastState;
+    int _stateAtSelection;
     int _roundShotCount;
     float _roundStartTime;
     int _shotsStat, _shotsMov, _shotsErr, _shotsRotating;
@@ -26,52 +39,45 @@ public class AdaptiveSpawnController : MonoBehaviour
     int _rotationLevel;
     int _spawnPace;
 
-    static readonly string[] TYPE_NAMES = {"Stationary", "Moving", "Erratic"};
-    static readonly string[] ROT_NAMES  = {"No rotation", "Slow rotation", "Medium rotation", "Fast rotation"};
-    static readonly string[] PACE_NAMES = {"Fast (1-2s)", "Medium (3-4s)", "Slow (5-6s)"};
+    // Captured at round end, consumed by ApplyFeedback.
+    float _capHitRate, _capAvgTTH, _capPtsPerTarget, _capShotsPerSec;
+    bool  _metricsCaptured;
 
-    // ── Public API ───────────────────────────────────────────────────────────
+    static readonly string[] TYPE_NAMES = { "Stationary", "Moving", "Erratic" };
+    static readonly string[] ROT_NAMES  = { "No rotation", "Slow rotation", "Medium rotation", "Fast rotation" };
+    static readonly string[] PACE_NAMES = { "Fast (1-2s)", "Medium (3-4s)", "Slow (5-6s)" };
 
-    /// <summary>
-    /// Called once at the start of every round.
-    /// The Q-learning agent picks an action here; those parameters are then
-    /// held fixed for the entire round — no mid-round overrides.
-    /// </summary>
+    // ── Round lifecycle ───────────────────────────────────────────────────────
+
     public void OnRoundStart()
     {
         if (activeProfile == null) return;
 
-        _lastState     = activeProfile.GetCurrentState();
-        previousAction = currentAction;
-        currentAction  = activeProfile.SelectAction();
+        _stateAtSelection = activeProfile.GetCurrentState();
+        previousAction    = currentAction;
+        currentAction     = activeProfile.SelectAction();
 
         PlayerSkillProfile.DecodeAction(currentAction, out _emphasisType, out _rotationLevel, out _spawnPace);
         ConfigureNextSpawn();
 
         currentActionDescription = $"Emphasis: {TYPE_NAMES[_emphasisType]} | " +
-                                   $"{ROT_NAMES[_rotationLevel]} | " +
-                                   $"Pace: {PACE_NAMES[_spawnPace]}";
+                                   $"{ROT_NAMES[_rotationLevel]} | Pace: {PACE_NAMES[_spawnPace]}";
 
-        _roundShotCount  = 0;
+        _roundShotCount = 0;
         _shotsStat = _shotsMov = _shotsErr = _shotsRotating = 0;
         _roundStartTime  = Time.time;
+        _metricsCaptured = false;
     }
 
-    /// <summary>
-    /// Called by ShooterTargetManager before every target spawn.
-    /// Uses the fixed action parameters chosen at round start.
-    /// </summary>
+    /// <summary>Applies the round-fixed action parameters before each spawn.</summary>
     public void ConfigureNextSpawn()
     {
         if (targetManager == null) return;
 
         float r = Random.value;
-        if (r < 0.6f)
-            targetManager.nextTargetType = (TargetType)_emphasisType;
-        else if (r < 0.8f)
-            targetManager.nextTargetType = (TargetType)((_emphasisType + 1) % 3);
-        else
-            targetManager.nextTargetType = (TargetType)((_emphasisType + 2) % 3);
+        if (r < 0.6f)      targetManager.nextTargetType = (TargetType)_emphasisType;
+        else if (r < 0.8f) targetManager.nextTargetType = (TargetType)((_emphasisType + 1) % 3);
+        else               targetManager.nextTargetType = (TargetType)((_emphasisType + 2) % 3);
 
         targetManager.nextRotation = (RotationSpeed)_rotationLevel;
 
@@ -83,55 +89,59 @@ public class AdaptiveSpawnController : MonoBehaviour
         }
     }
 
-    public void OnRoundEnd()
+    /// <summary>Snapshot the round's measured metrics. No Q-update happens here.</summary>
+    public void CaptureRoundMetrics()
     {
-        if (activeProfile == null) return;
+        if (activeProfile == null || roundManager == null) return;
 
         var s = roundManager.stats;
-        float hitRate     = s.HitRate;
-        float avgTTH      = ComputeAvgTimeToHit();
-        float duration    = Time.time - _roundStartTime;
-        float shotsPerSec = duration > 0.1f ? _roundShotCount / duration : 0f;
+        _capHitRate      = s.HitRate;
+        _capAvgTTH       = ComputeAvgTimeToHit();
+        _capPtsPerTarget = s.totalTargetsSpawned > 0 ? (float)s.totalPoints / s.totalTargetsSpawned : 0f;
+        float duration   = Time.time - _roundStartTime;
+        _capShotsPerSec  = duration > 0.1f ? _roundShotCount / duration : 0f;
+        _metricsCaptured = true;
+    }
 
-        float hrStat = s.stationary.HitRate;
-        float hrMov  = s.moving.HitRate;
-        float hrErr  = s.erratic.HitRate;
-        float tthStat = s.stationary.AvgTimeToHit;
-        float tthMov  = s.moving.AvgTimeToHit;
-        float tthErr  = s.erratic.AvgTimeToHit;
-        float ptsStat = s.stationary.AvgPointsPerHit;
-        float ptsMov  = s.moving.AvgPointsPerHit;
-        float ptsErr  = s.erratic.AvgPointsPerHit;
-        float hrRot   = s.rotating.HitRate;
-        float ptsPerTarget = s.totalTargetsSpawned > 0
-            ? (float)s.totalPoints / s.totalTargetsSpawned : 0f;
+    /// <summary>
+    /// Apply the player's difficulty rating: compute reward, run the Q-update,
+    /// build the explainability strings, and persist the profile.
+    /// </summary>
+    public void ApplyFeedback(DifficultyRating rating)
+    {
+        if (activeProfile == null) return;
+        if (!_metricsCaptured) CaptureRoundMetrics();
 
-        float reward = PlayerSkillProfile.ComputeFlowReward(
-            hitRate, avgTTH, ptsPerTarget, hrStat, hrMov, hrErr);
+        float reward = PlayerSkillProfile.ComputeRatingReward(rating);
+        lastReward      = reward;
+        lastRatingValue = (int)rating;
+        lastRatingLabel = PlayerSkillProfile.RatingLabel(rating);
 
-        previousAction = currentAction;
+        int actionJustPlayed = currentAction;
+
         activeProfile.UpdateAfterRound(
-            hitRate, avgTTH, shotsPerSec,
-            hrStat, hrMov, hrErr,
-            tthStat, tthMov, tthErr,
-            ptsStat, ptsMov, ptsErr,
-            hrRot, ptsPerTarget,
-            currentAction, reward);
+            _stateAtSelection, actionJustPlayed, rating, reward,
+            _capHitRate, _capAvgTTH);
 
-        int nextAction = activeProfile.SelectAction();
-        lastUpdateExplanation = PlayerSkillProfile.ExplainActionChange(currentAction, nextAction);
+        // What will change next round (greedy intent for the new state).
+        int nextAction = activeProfile.GreedyAction();
+        lastUpdateExplanation = PlayerSkillProfile.ExplainActionChange(actionJustPlayed, nextAction);
 
+        string direction = reward > 0f ? "reinforcing" : "discouraging";
+        string guidance  = activeProfile.lastGuidanceNote;
         lastRoundSummary =
-            $"Hit: {hitRate:P0} | TTH: {avgTTH:F1}s | Pts/target: {ptsPerTarget:F1}\n" +
-            $"Stat: {hrStat:P0} | Mov: {hrMov:P0} | Err: {hrErr:P0}\n" +
-            $"Rot: {hrRot:P0} | Reward: {reward:F2} | \u03b5: {activeProfile.epsilon:F2}";
+            $"You rated: {lastRatingLabel}\n" +
+            $"Hit rate {_capHitRate:P0} | avg {_capAvgTTH:F1}s | {_capPtsPerTarget:F1} pts/target\n" +
+            $"Agent {direction} \u201c{PlayerSkillProfile.DescribeAction(actionJustPlayed)}\u201d " +
+            $"(reward {reward:+0.0;-0.0})" +
+            (string.IsNullOrEmpty(guidance) ? "" : $"\n{guidance}");
 
         bool isTraining = activeProfile.playerName != null &&
                           activeProfile.playerName.StartsWith("_training_");
         if (!isTraining)
             activeProfile.Save();
 
-        Debug.Log($"[Adaptive] {lastRoundSummary}\n{lastUpdateExplanation}");
+        Debug.Log($"[Adaptive] {lastRoundSummary}\n{lastUpdateExplanation} | \u03b5={activeProfile.epsilon:F2}");
     }
 
     public void OnShotFired(TargetType targetType, bool wasRotating)
@@ -139,9 +149,9 @@ public class AdaptiveSpawnController : MonoBehaviour
         _roundShotCount++;
         switch (targetType)
         {
-            case TargetType.Stationary: _shotsStat++;    break;
-            case TargetType.Moving:     _shotsMov++;     break;
-            case TargetType.Erratic:    _shotsErr++;     break;
+            case TargetType.Stationary: _shotsStat++; break;
+            case TargetType.Moving:     _shotsMov++;  break;
+            case TargetType.Erratic:    _shotsErr++;  break;
         }
         if (wasRotating) _shotsRotating++;
     }

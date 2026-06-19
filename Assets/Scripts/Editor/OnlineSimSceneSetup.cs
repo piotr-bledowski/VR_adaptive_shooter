@@ -125,6 +125,7 @@ public static class OnlineSimSceneSetup
         ctrl.adaptiveController   = asc;
         ctrl.roundManager         = roundMgr;
         ctrl.eventLog             = eventLog;
+        ctrl.syntheticPlayer      = synth;
         ctrl.skillLevel           = skillLevel;
         ctrl.roundsToSimulate     = roundsToSimulate;
         ctrl.simulationTimeScale  = 8f;

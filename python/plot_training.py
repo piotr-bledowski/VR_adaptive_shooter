@@ -52,7 +52,7 @@ def plot_report(csv_path):
     # 1. Reward over rounds
     ax = fig.add_subplot(gs[0, 0])
     ax.plot(rounds, col(rows, "reward"), linewidth=0.8, alpha=0.5, label="per-round")
-    window = min(20, len(rows))
+    window = min(10, len(rows))
     if window > 1:
         smoothed = running_avg(col(rows, "reward"), window)
         ax.plot(rounds[window - 1:], smoothed, linewidth=2, label=f"{window}-round avg")

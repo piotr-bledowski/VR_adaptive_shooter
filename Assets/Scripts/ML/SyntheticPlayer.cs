@@ -2,32 +2,30 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Synthetic players designed for clean Q-learning.
+/// Synthetic player for OFFLINE Q-learning experiments only.
 ///
-/// KEY BEHAVIOUR: the player does NOT fire into empty air.  When no target is
-/// active the player waits; when a target appears they apply a reaction delay
-/// before the first shot.  This means:
+/// Two jobs:
+///   1. Shoot targets with a profile-dependent, type/rotation-dependent accuracy.
+///      The player never fires into empty air, so observed hit rate == per-shot
+///      accuracy against the spawned mix — a clean signal for the agent.
+///   2. Rate the round on the 5-point difficulty scale via <see cref="RateRound"/>,
+///      according to that persona's preferences. This rating drives the reward.
 ///
-///   hit rate  =  hits / shots_at_targets  (not diluted by empty-air shots)
+/// ── Persona preferences (what makes them say "Perfect") ────────────────────
 ///
-/// That makes hit rate equal to per-shot accuracy against the given mix of
-/// targets, which is a clean, learnable signal.
+///   Naive  / Beginner     : likes STATIONARY + SLOW, no rotation; comfortable
+///                           accuracy band 0.50–0.80. Hates rotation and lots of
+///                           moving/erratic targets (→ Hard / Too Hard).
 ///
-/// ── Designed optimal actions ─────────────────────────────────────────────
+///   Average / Intermediate: dislikes STATIONARY emphasis (boring); wants accuracy
+///                           near 0.50; indifferent to rotation.
 ///
-/// Effective hit rate is computed as:
-///   1 / (0.6 * (1/hrA) + 0.2 * (1/hrB) + 0.2 * (1/hrC))
-/// where hrA/B/C are the base hit chances for the three target types weighted
-/// by the agent's 60 / 20 / 20 emphasis mix.
+///   Expert / Advanced     : wants a real challenge — accuracy near 0.30 is Perfect;
+///                           anything comfortable reads as "Too Easy".
 ///
-///   Naive    Stationary, no rotation  →  ~46 %   (reward +2.0, in sweet zone)
-///            Any other action         →  < 38 %  (reward ≤ +0.3)
-///
-///   Average  Stationary or Moving, no rotation  →  ~51-57 %   (+2.0)
-///            Any rotation                        →  < 44 %    (+0.3 or −1.0)
-///
-///   Expert   Any emphasis, fast rotation         →  ~54-61 %   (+2.0)
-///            Fast rotation clearly best; no rotation gives > 85 %  (−1.0)
+/// Hit rates below are tuned so that for every persona at least one agent action
+/// lands accuracy inside that persona's Perfect band (see header maths in
+/// <see cref="EmphasisWeightedBase"/>).
 /// </summary>
 public class SyntheticPlayer : MonoBehaviour
 {
@@ -42,13 +40,13 @@ public class SyntheticPlayer : MonoBehaviour
     public ShooterEventLog      eventLog;
 
     [Header("Fire rate (shots per second)")]
-    public float naiveFireRate   = 0.7f;
-    public float averageFireRate = 1.5f;
-    public float expertFireRate  = 3.5f;
+    public float naiveFireRate   = 0.8f;
+    public float averageFireRate = 1.6f;
+    public float expertFireRate  = 3.2f;
 
     float _nextShotTime;
     bool  _roundActive;
-    bool  _waitingForTarget;   // true when polled with no active target
+    bool  _waitingForTarget;
 
     // ── Unity lifecycle ──────────────────────────────────────────────────────
 
@@ -65,7 +63,7 @@ public class SyntheticPlayer : MonoBehaviour
         {
             _roundActive      = true;
             _waitingForTarget = true;
-            _nextShotTime     = Time.time; // start checking for targets immediately
+            _nextShotTime     = Time.time;
         }
 
         if (Time.time >= _nextShotTime)
@@ -78,23 +76,20 @@ public class SyntheticPlayer : MonoBehaviour
     {
         var activeTargets = targetManager?.ActiveTargetsList;
 
-        // ── No target present: wait silently (don't record a shot) ───────────
         if (activeTargets == null || activeTargets.Count == 0)
         {
             _waitingForTarget = true;
-            _nextShotTime     = Time.time + 0.05f; // fast poll
+            _nextShotTime     = Time.time + 0.05f;
             return;
         }
 
-        // ── Target just appeared after a wait: apply reaction delay ──────────
         if (_waitingForTarget)
         {
             _waitingForTarget = false;
             _nextShotTime     = Time.time + GetReactionDelay();
-            return; // don't fire until reaction delay passes
+            return;
         }
 
-        // ── Fire at the oldest active target ─────────────────────────────────
         ShooterTarget target = PickOldestTarget(activeTargets);
         if (target == null) { _nextShotTime = Time.time + 0.05f; return; }
 
@@ -119,13 +114,10 @@ public class SyntheticPlayer : MonoBehaviour
         else
         {
             float missAngle = Random.Range(0f, 15f);
-            if (missAngle < GetNearMissAngle())
-                eventLog?.LogCloseMiss(ttype);
-            else
-                eventLog?.LogShotMiss(playerPos);
+            if (missAngle < GetNearMissAngle()) eventLog?.LogCloseMiss(ttype);
+            else                                eventLog?.LogShotMiss(playerPos);
         }
 
-        // Schedule next shot
         float interval = 1f / GetFireRate();
         _nextShotTime  = Time.time + interval * GetFireIntervalJitter();
     }
@@ -135,88 +127,130 @@ public class SyntheticPlayer : MonoBehaviour
         if (targets.Count == 0) return null;
         ShooterTarget oldest = targets[0];
         for (int i = 1; i < targets.Count; i++)
-        {
-            if (targets[i].LastSpawnTime < oldest.LastSpawnTime)
-                oldest = targets[i];
-        }
+            if (targets[i].LastSpawnTime < oldest.LastSpawnTime) oldest = targets[i];
         return oldest;
     }
 
-    // ── Hit chance per target type and rotation ──────────────────────────────
-    //
-    // Verified effective hit rates per emphasis mix (60 / 20 / 20):
-    //
-    //   Naive   Stat+None  : 1/(0.6/0.75 + 0.2/0.42 + 0.2/0.22) = 45.8 %
-    //           Mov+None   : 1/(0.2/0.75 + 0.6/0.42 + 0.2/0.22) = 38.4 %
-    //           Err+None   : 1/(0.2/0.75 + 0.2/0.42 + 0.6/0.22) = 28.8 %
-    //
-    //   Average Stat+None  : 1/(0.6/0.88 + 0.2/0.55 + 0.2/0.28) = 56.8 %
-    //           Mov+None   : 1/(0.2/0.88 + 0.6/0.55 + 0.2/0.28) = 49.2 %
-    //           Stat+Slow  : 1/(0.6/0.70 + 0.2/0.44 + 0.2/0.22) = 43.8 %   (rot hurts)
-    //           Any+Medium : ≈ 35 %   Any+Fast : ≈ 25 %   (clear worse)
-    //
-    //   Expert  Any+Fast   : ~56-62 %  (all near sweet spot)
-    //           Any+Medium : ~67-75 %  (above sweet spot)
-    //           Any+None   : ~82-91 %  (way above → bad reward)
+    // ── Hit chance model ──────────────────────────────────────────────────────
 
-    float GetHitChance(TargetType type, RotationSpeed rotation)
+    float BaseHitRate(SkillProfile p, TargetType type)
     {
-        float base0;
-        switch (profile)
+        switch (p)
         {
             case SkillProfile.Naive:
-                base0 = type == TargetType.Stationary ? 0.75f
-                      : type == TargetType.Moving     ? 0.42f
-                                                      : 0.22f;
-                break;
+                return type == TargetType.Stationary ? 0.70f
+                     : type == TargetType.Moving     ? 0.45f : 0.30f;
             case SkillProfile.Average:
-                base0 = type == TargetType.Stationary ? 0.88f
-                      : type == TargetType.Moving     ? 0.55f
-                                                      : 0.28f;
-                break;
+                return type == TargetType.Stationary ? 0.85f
+                     : type == TargetType.Moving     ? 0.58f : 0.42f;
             case SkillProfile.Expert:
-                base0 = type == TargetType.Stationary ? 0.97f
-                      : type == TargetType.Moving     ? 0.90f
-                                                      : 0.76f;
-                break;
-            default: base0 = 0.5f; break;
+                return type == TargetType.Stationary ? 0.96f
+                     : type == TargetType.Moving     ? 0.82f : 0.58f;
+            default: return 0.5f;
         }
-        return base0 * GetRotationMultiplier(rotation);
     }
 
-    float GetRotationMultiplier(RotationSpeed rotation)
+    float RotationMultiplier(SkillProfile p, RotationSpeed rot)
     {
-        switch (profile)
+        switch (p)
         {
             case SkillProfile.Naive:
-                switch (rotation)
-                {
-                    case RotationSpeed.Slow:   return 0.72f;
-                    case RotationSpeed.Medium: return 0.52f;
-                    case RotationSpeed.Fast:   return 0.33f;
-                    default: return 1f;
-                }
+                return rot == RotationSpeed.None ? 1f : rot == RotationSpeed.Slow ? 0.75f
+                     : rot == RotationSpeed.Medium ? 0.55f : 0.40f;
             case SkillProfile.Average:
-                switch (rotation)
-                {
-                    case RotationSpeed.Slow:   return 0.80f;
-                    case RotationSpeed.Medium: return 0.60f;
-                    case RotationSpeed.Fast:   return 0.40f;
-                    default: return 1f;
-                }
+                return rot == RotationSpeed.None ? 1f : rot == RotationSpeed.Slow ? 0.82f
+                     : rot == RotationSpeed.Medium ? 0.66f : 0.50f;
             case SkillProfile.Expert:
-                // Fast rotation is the only sweet-spot multiplier for Expert.
-                // No rotation → ~85-91% hit rate → bad reward.
-                // Fast rotation → ~56-62% hit rate → reward sweet zone.
-                switch (rotation)
-                {
-                    case RotationSpeed.Slow:   return 0.92f;
-                    case RotationSpeed.Medium: return 0.82f;
-                    case RotationSpeed.Fast:   return 0.68f;
-                    default: return 1f;
-                }
+                return rot == RotationSpeed.None ? 1f : rot == RotationSpeed.Slow ? 0.88f
+                     : rot == RotationSpeed.Medium ? 0.70f : 0.46f;
             default: return 1f;
         }
+    }
+
+    float GetHitChance(TargetType type, RotationSpeed rotation)
+        => BaseHitRate(profile, type) * RotationMultiplier(profile, rotation);
+
+    /// <summary>
+    /// Expected accuracy for a given emphasis (the agent spawns 60/20/20 across the
+    /// emphasised type and the two others) at a given rotation level. Used to verify
+    /// each persona has a reachable Perfect band; mirrors the live shot distribution.
+    /// </summary>
+    float EmphasisWeightedBase(int emphasis)
+    {
+        float s = BaseHitRate(profile, TargetType.Stationary);
+        float m = BaseHitRate(profile, TargetType.Moving);
+        float e = BaseHitRate(profile, TargetType.Erratic);
+        switch (emphasis)
+        {
+            case 0:  return 0.6f * s + 0.2f * m + 0.2f * e;
+            case 1:  return 0.6f * m + 0.2f * e + 0.2f * s;
+            default: return 0.6f * e + 0.2f * s + 0.2f * m;
+        }
+    }
+
+    // ── Difficulty rating (the reward signal) ──────────────────────────────────
+
+    /// <summary>
+    /// Rate the round just played according to this persona's preferences.
+    /// Reads the agent's committed action (emphasis / rotation / pace) and the
+    /// measured hit rate.
+    /// </summary>
+    public DifficultyRating RateRound(ShooterStats stats)
+    {
+        int emphasis = 1, rotation = 0, pace = 1;
+        var asc = roundManager != null ? roundManager.adaptiveController : null;
+        if (asc != null)
+            PlayerSkillProfile.DecodeAction(asc.currentAction, out emphasis, out rotation, out pace);
+
+        float hr = stats != null ? stats.HitRate : 0f;
+
+        switch (profile)
+        {
+            case SkillProfile.Naive:   return RateBeginner(hr, emphasis, rotation, pace);
+            case SkillProfile.Average: return RateIntermediate(hr, emphasis);
+            case SkillProfile.Expert:  return RateAdvanced(hr);
+            default:                   return DifficultyRating.Perfect;
+        }
+    }
+
+    // Beginner: stationary + slow + no rotation, accuracy 0.50–0.80.
+    DifficultyRating RateBeginner(float hr, int emphasis, int rotation, int pace)
+    {
+        // Strong dislikes push toward Hard / Too Hard regardless of accuracy.
+        if (rotation >= 3)                       return DifficultyRating.TooHard; // fast rotation hated
+        if (rotation >= 1 && emphasis != 0)      return DifficultyRating.TooHard; // rotating + non-stationary
+        if (rotation >= 1)                       return DifficultyRating.Hard;    // any rotation
+        if (emphasis == 2)                       return DifficultyRating.TooHard; // lots of erratic
+        if (emphasis == 1)                       return DifficultyRating.Hard;    // lots of moving
+
+        // Stationary + no rotation: judge by accuracy, then pace comfort.
+        if (hr > 0.85f) return DifficultyRating.TooEasy;
+        if (hr < 0.45f) return DifficultyRating.TooHard;
+        if (hr >= 0.50f && hr <= 0.80f)
+            return pace == 0 ? DifficultyRating.Hard   // fast spawns feel rushed for a beginner
+                             : DifficultyRating.Perfect;
+        return hr > 0.80f ? DifficultyRating.Easy : DifficultyRating.Hard;
+    }
+
+    // Intermediate: dislikes stationary; wants accuracy ≈ 0.50; ignores rotation.
+    DifficultyRating RateIntermediate(float hr, int emphasis)
+    {
+        if (emphasis == 0)
+            return hr > 0.55f ? DifficultyRating.TooEasy : DifficultyRating.Hard; // boring
+
+        float d = hr - 0.50f;
+        if (Mathf.Abs(d) <= 0.12f) return DifficultyRating.Perfect;   // 0.38 – 0.62
+        if (d > 0f) return hr > 0.72f ? DifficultyRating.TooEasy : DifficultyRating.Easy;
+        return hr < 0.28f ? DifficultyRating.TooHard : DifficultyRating.Hard;
+    }
+
+    // Advanced: wants to struggle; accuracy ≈ 0.30 is Perfect.
+    DifficultyRating RateAdvanced(float hr)
+    {
+        if (hr >= 0.20f && hr <= 0.42f) return DifficultyRating.Perfect;
+        if (hr < 0.20f)  return hr < 0.12f ? DifficultyRating.TooHard : DifficultyRating.Hard;
+        if (hr > 0.60f)  return DifficultyRating.TooEasy;
+        return DifficultyRating.Easy;   // 0.42 – 0.60 : a touch too comfortable
     }
 
     // ── Point zone distribution ──────────────────────────────────────────────
@@ -224,23 +258,21 @@ public class SyntheticPlayer : MonoBehaviour
     int SimulatePoints(ShooterTarget target)
     {
         float pen = GetRotationPointPenalty(target.rotationSpeed);
-        float r   = Random.value + pen;   // pen shifts hits away from centre
+        float r   = Random.value + pen;
 
         switch (profile)
         {
             case SkillProfile.Expert:
-                if (r < 0.45f) return target.centerPoints;   // 10
-                if (r < 0.77f) return target.innerPoints;    // 5
-                if (r < 0.93f) return target.middlePoints;   // 2
-                return target.outerPoints;                    // 1
-
+                if (r < 0.45f) return target.centerPoints;
+                if (r < 0.77f) return target.innerPoints;
+                if (r < 0.93f) return target.middlePoints;
+                return target.outerPoints;
             case SkillProfile.Average:
                 if (r < 0.08f) return target.centerPoints;
                 if (r < 0.28f) return target.innerPoints;
                 if (r < 0.62f) return target.middlePoints;
                 return target.outerPoints;
-
-            default: // Naive
+            default:
                 if (r < 0.02f) return target.centerPoints;
                 if (r < 0.08f) return target.innerPoints;
                 if (r < 0.30f) return target.middlePoints;
@@ -250,14 +282,9 @@ public class SyntheticPlayer : MonoBehaviour
 
     float GetRotationPointPenalty(RotationSpeed rotation)
     {
-        float pen;
-        switch (rotation)
-        {
-            case RotationSpeed.Slow:   pen = 0.10f; break;
-            case RotationSpeed.Medium: pen = 0.22f; break;
-            case RotationSpeed.Fast:   pen = 0.38f; break;
-            default:                   pen = 0f;    break;
-        }
+        float pen = rotation == RotationSpeed.Slow ? 0.10f
+                  : rotation == RotationSpeed.Medium ? 0.22f
+                  : rotation == RotationSpeed.Fast ? 0.38f : 0f;
         if (profile == SkillProfile.Expert) pen *= 0.5f;
         return pen;
     }
@@ -274,7 +301,6 @@ public class SyntheticPlayer : MonoBehaviour
         }
     }
 
-    /// <summary>Delay between a target appearing and the first shot at it.</summary>
     float GetReactionDelay()
     {
         switch (profile)

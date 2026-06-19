@@ -116,6 +116,10 @@ public static class ShooterSceneSetup
         SkillPromptUI skillPrompt = promptObj.AddComponent<SkillPromptUI>();
         CreateSkillPromptUI(promptObj, skillPrompt, rig);
 
+        // Difficulty feedback panel (5 shootable buttons shown after each round)
+        DifficultyFeedbackUI feedbackUI = CreateDifficultyFeedbackUI(rangeRoot.transform);
+        roundMgr.feedbackUI = feedbackUI;
+
         // ── Wire session / lobby ──────────────────────────────────────────────
         if (selectUI != null)
         {
@@ -1132,7 +1136,7 @@ public static class ShooterSceneSetup
         srt.anchoredPosition = new Vector2(0f, 70f);
         srt.sizeDelta        = new Vector2(320f, 70f);
 
-        // ── Stats panel (centre screen, hidden until round ends) ────────────────
+        // ── Stats panel (two columns: stats left, agent verdict right) ─────────
         GameObject statsPanel = new GameObject("StatsPanel");
         statsPanel.transform.SetParent(gameplayRoot.transform, false);
         Image panelBg = statsPanel.AddComponent<Image>();
@@ -1143,23 +1147,42 @@ public static class ShooterSceneSetup
         sprt.anchorMin        = new Vector2(0.5f, 0.5f);
         sprt.anchorMax        = new Vector2(0.5f, 0.5f);
         sprt.pivot            = new Vector2(0.5f, 0.5f);
-        sprt.anchoredPosition = new Vector2(0f, -20f);
-        sprt.sizeDelta        = new Vector2(360f, 400f);
+        sprt.anchoredPosition = new Vector2(-55f, -10f);
+        sprt.sizeDelta        = new Vector2(720f, 420f);
 
         GameObject statsTextObj = new GameObject("StatsText");
         statsTextObj.transform.SetParent(statsPanel.transform, false);
         Text statsText = statsTextObj.AddComponent<Text>();
         statsText.font      = font;
-        statsText.fontSize  = 20;
-        statsText.alignment = TextAnchor.UpperCenter;
+        statsText.fontSize  = 18;
+        statsText.alignment = TextAnchor.UpperLeft;
         statsText.color     = Color.white;
         statsText.text      = "";
+        statsText.horizontalOverflow = HorizontalWrapMode.Wrap;
+        statsText.verticalOverflow   = VerticalWrapMode.Overflow;
 
         RectTransform strt = statsTextObj.GetComponent<RectTransform>();
-        strt.anchorMin = Vector2.zero;
-        strt.anchorMax = Vector2.one;
-        strt.offsetMin = new Vector2(16f, 16f);
-        strt.offsetMax = new Vector2(-16f, -16f);
+        strt.anchorMin = new Vector2(0f, 0f);
+        strt.anchorMax = new Vector2(0.48f, 1f);
+        strt.offsetMin = new Vector2(12f, 12f);
+        strt.offsetMax = new Vector2(-6f, -12f);
+
+        GameObject agentTextObj = new GameObject("AgentText");
+        agentTextObj.transform.SetParent(statsPanel.transform, false);
+        Text agentText = agentTextObj.AddComponent<Text>();
+        agentText.font      = font;
+        agentText.fontSize  = 18;
+        agentText.alignment = TextAnchor.UpperLeft;
+        agentText.color     = new Color(0.82f, 0.94f, 1f);
+        agentText.text      = "";
+        agentText.horizontalOverflow = HorizontalWrapMode.Wrap;
+        agentText.verticalOverflow   = VerticalWrapMode.Overflow;
+
+        RectTransform art = agentTextObj.GetComponent<RectTransform>();
+        art.anchorMin = new Vector2(0.52f, 0f);
+        art.anchorMax = new Vector2(1f, 1f);
+        art.offsetMin = new Vector2(6f, 12f);
+        art.offsetMax = new Vector2(-12f, -12f);
 
         // ── Stamina bar (bottom-centre) ─────────────────────────────────────────
         GameObject barBg = new GameObject("StaminaBg");
@@ -1201,6 +1224,7 @@ public static class ShooterSceneSetup
         hud.playerNameText  = playerNameText;
         hud.timerText       = timerText;
         hud.statsText       = statsText;
+        hud.agentText       = agentText;
         hud.statsPanel      = statsPanel;
         hud.gameplayHudRoot = gameplayRoot;
 
@@ -1278,6 +1302,82 @@ public static class ShooterSceneSetup
     // ═════════════════════════════════════════════════════════════════════════════
     // Skill Prompt UI (VR panel for new player skill selection)
     // ═════════════════════════════════════════════════════════════════════════════
+
+    // ═════════════════════════════════════════════════════════════════════════════
+    // Difficulty feedback UI (5 shootable buttons along the firing line)
+    // ═════════════════════════════════════════════════════════════════════════════
+
+    static DifficultyFeedbackUI CreateDifficultyFeedbackUI(Transform parent)
+    {
+        GameObject root = new GameObject("DifficultyFeedback");
+        root.transform.SetParent(parent, false);
+        DifficultyFeedbackUI ui = root.AddComponent<DifficultyFeedbackUI>();
+
+        // Buttons live under a child that toggles on/off; the component itself
+        // stays active so its Awake() wires the button listeners.
+        GameObject buttons = new GameObject("Buttons");
+        buttons.transform.SetParent(root.transform, false);
+
+        Font font = GetBuiltinFont();
+
+        // Row of five buttons at the firing line (z = 7.5), just above the barrier.
+        const float z = 7.5f, y = 1.02f, spacing = 0.92f;
+        Color blue  = new Color(0.20f, 0.45f, 0.85f);
+        Color teal  = new Color(0.20f, 0.65f, 0.70f);
+        Color green = new Color(0.15f, 0.70f, 0.25f);
+        Color amber = new Color(0.85f, 0.55f, 0.12f);
+        Color red   = new Color(0.80f, 0.20f, 0.15f);
+
+        ui.tooEasyButton = CreateFeedbackButton(buttons.transform, "TooEasyBtn", "TOO\nEASY",
+            blue,  new Vector3(-2f * spacing, y, z), font);
+        ui.easyButton    = CreateFeedbackButton(buttons.transform, "EasyBtn", "EASY",
+            teal,  new Vector3(-1f * spacing, y, z), font);
+        ui.perfectButton = CreateFeedbackButton(buttons.transform, "PerfectBtn", "PERFECT",
+            green, new Vector3(0f,            y, z), font);
+        ui.hardButton    = CreateFeedbackButton(buttons.transform, "HardBtn", "HARD",
+            amber, new Vector3(1f * spacing,  y, z), font);
+        ui.tooHardButton = CreateFeedbackButton(buttons.transform, "TooHardBtn", "TOO\nHARD",
+            red,   new Vector3(2f * spacing,  y, z), font);
+
+        ui.panelRoot = buttons;
+        return ui;
+    }
+
+    static ShooterButton CreateFeedbackButton(Transform parent, string goName, string label,
+        Color color, Vector3 worldPos, Font font)
+    {
+        GameObject btnGo = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        btnGo.name = goName;
+        btnGo.transform.SetParent(parent, true);
+        btnGo.transform.position   = worldPos;
+        btnGo.transform.localScale = new Vector3(0.62f, 0.38f, 0.12f);
+
+        Material mat = new Material(Shader.Find("Standard")) { color = color };
+        mat.EnableKeyword("_EMISSION");
+        mat.SetColor("_EmissionColor", color * 0.35f);
+        btnGo.GetComponent<Renderer>().sharedMaterial = mat;
+        EnsureSolidCollider(btnGo);
+
+        // Label on the face toward the player (player stands at z=3 looking +Z).
+        // Identity rotation matches the confirmed-readable orientation used elsewhere.
+        GameObject lblGo = new GameObject("Label");
+        lblGo.transform.SetParent(btnGo.transform, false);
+        lblGo.transform.localPosition = new Vector3(0f, 0f, -0.6f);
+        lblGo.transform.localRotation = Quaternion.identity;
+        lblGo.transform.localScale    = new Vector3(0.06f, 0.1f, 0.5f);
+
+        TextMesh tm = lblGo.AddComponent<TextMesh>();
+        tm.font          = font;
+        tm.text          = label;
+        tm.fontSize      = 64;
+        tm.characterSize = 0.1f;
+        tm.anchor        = TextAnchor.MiddleCenter;
+        tm.alignment     = TextAlignment.Center;
+        tm.color         = Color.white;
+        if (font != null) lblGo.GetComponent<MeshRenderer>().sharedMaterial = font.material;
+
+        return btnGo.AddComponent<ShooterButton>();
+    }
 
     static void CreateSkillPromptUI(GameObject promptObj, SkillPromptUI promptUI, OVRCameraRig rig)
     {
